@@ -1,30 +1,37 @@
 """
 Coletor PNCP - Portal Nacional de Contratações Públicas
-API: https://pncp.gov.br
-Tenta múltiplos endpoints para contornar bloqueios geográficos.
+
+O PNCP bloqueia IPs de cloud americanos no endpoint /api/pncp/v1.
+Estratégia: tenta múltiplos endpoints e loga o erro exato para diagnóstico.
 """
 
 import asyncio
 import httpx
 from datetime import date, timedelta
 from loguru import logger
-from tenacity import retry, stop_after_attempt, wait_exponential
 
+# Endpoints em ordem de prioridade
 ENDPOINTS = [
     "https://pncp.gov.br/api/consulta/v1/contratacoes/publicacoes",
     "https://pncp.gov.br/api/pncp/v1/contratacoes/publicacoes",
+    "https://treina.pncp.gov.br/api/pncp/v1/contratacoes/publicacoes",
 ]
 
 HEADERS = {
-    "Accept": "application/json",
-    "Accept-Language": "pt-BR,pt;q=0.9",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
+        "Chrome/121.0.0.0 Safari/537.36"
     ),
-    "Referer": "https://pncp.gov.br/",
+    "Referer": "https://pncp.gov.br/app/",
     "Origin": "https://pncp.gov.br",
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-origin",
 }
 
 MODALIDADES_MAP = {
@@ -49,8 +56,9 @@ class PNCPCollector:
         self.db = db_session
         self.client = httpx.AsyncClient(
             headers=HEADERS,
-            timeout=60.0,
+            timeout=httpx.Timeout(connect=15.0, read=45.0, write=10.0, pool=10.0),
             follow_redirects=True,
+            http2=False,
         )
         self._endpoint_ativo = ENDPOINTS[0]
 
@@ -61,49 +69,85 @@ class PNCPCollector:
         await self.client.aclose()
 
     async def _get(self, params: dict) -> dict | None:
-        """Tenta cada endpoint até um retornar dados válidos."""
+        """Tenta cada endpoint. Loga o erro exato de cada falha."""
         for endpoint in ENDPOINTS:
             try:
                 r = await self.client.get(endpoint, params=params)
 
-                if r.status_code in (403, 429, 503):
-                    logger.warning(f"PNCP bloqueou {endpoint} (HTTP {r.status_code}), tentando próximo...")
-                    await asyncio.sleep(2)
-                    continue
+                logger.debug(f"PNCP {endpoint} → HTTP {r.status_code}")
 
-                if r.status_code == 404:
-                    continue
+                if r.status_code == 200:
+                    try:
+                        data = r.json()
+                    except Exception as json_err:
+                        logger.warning(
+                            f"PNCP {endpoint}: JSON inválido — {json_err} | "
+                            f"body={r.text[:300]}"
+                        )
+                        continue
 
-                if r.status_code != 200:
-                    logger.warning(f"PNCP {endpoint} retornou {r.status_code}")
-                    continue
-
-                try:
-                    data = r.json()
-                except Exception:
-                    logger.warning(f"PNCP {endpoint} JSON inválido: {r.text[:200]}")
-                    continue
-
-                result = self._normalizar_resposta(data)
-
-                if result.get("totalRegistros", 0) > 0:
-                    if endpoint != self._endpoint_ativo:
-                        logger.info(f"PNCP: endpoint ativo = {endpoint}")
+                    result = self._normalizar_resposta(data)
+                    if result.get("totalRegistros", 0) > 0:
                         self._endpoint_ativo = endpoint
                     return result
 
-                # Resposta válida mas vazia — legítimo para períodos sem dados
-                logger.debug(f"PNCP {endpoint}: 0 resultados para {params}")
-                return result
+                if r.status_code == 204:
+                    return {"data": [], "totalRegistros": 0, "totalPaginas": 0}
 
-            except httpx.TimeoutException:
-                logger.warning(f"PNCP {endpoint}: timeout")
+                if r.status_code in (301, 302, 307, 308):
+                    logger.warning(f"PNCP {endpoint}: redirect para {r.headers.get('location')}")
+                    continue
+
+                if r.status_code == 401:
+                    logger.warning(f"PNCP {endpoint}: autenticação necessária (401)")
+                    continue
+
+                if r.status_code == 403:
+                    logger.warning(
+                        f"PNCP {endpoint}: acesso negado (403) — possível bloqueio geográfico. "
+                        f"body={r.text[:200]}"
+                    )
+                    continue
+
+                if r.status_code == 429:
+                    logger.warning(f"PNCP {endpoint}: rate limit (429)")
+                    await asyncio.sleep(5)
+                    continue
+
+                if r.status_code == 503:
+                    logger.warning(f"PNCP {endpoint}: serviço indisponível (503)")
+                    await asyncio.sleep(3)
+                    continue
+
+                if r.status_code == 404:
+                    logger.debug(f"PNCP {endpoint}: 404")
+                    continue
+
+                logger.warning(
+                    f"PNCP {endpoint}: HTTP {r.status_code} inesperado | "
+                    f"body={r.text[:300]}"
+                )
+                continue
+
+            except httpx.ConnectError as e:
+                logger.warning(f"PNCP {endpoint}: ConnectError — {e}")
+                continue
+            except httpx.ConnectTimeout as e:
+                logger.warning(f"PNCP {endpoint}: ConnectTimeout — {e}")
+                continue
+            except httpx.ReadTimeout as e:
+                logger.warning(f"PNCP {endpoint}: ReadTimeout — {e}")
+                continue
+            except httpx.ProxyError as e:
+                logger.warning(f"PNCP {endpoint}: ProxyError — {e}")
                 continue
             except Exception as e:
-                logger.warning(f"PNCP {endpoint}: {type(e).__name__}: {e}")
+                logger.warning(f"PNCP {endpoint}: {type(e).__name__} — {e}")
                 continue
 
-        logger.error("PNCP: todos os endpoints falharam")
+        logger.error(
+            f"PNCP: todos os {len(ENDPOINTS)} endpoints falharam para params={params}"
+        )
         return None
 
     def _normalizar_resposta(self, data) -> dict:
@@ -116,20 +160,22 @@ class PNCPCollector:
                 return {
                     "data": data.get("data", []),
                     "totalRegistros": data.get("totalRegistros", 0),
-                    "totalPaginas": data.get("totalPaginas", 1),
+                    "totalPaginas": data.get("totalPaginas", 1) or 1,
                 }
             if "content" in data:
                 return {
                     "data": data.get("content", []),
                     "totalRegistros": data.get("totalElements", 0),
-                    "totalPaginas": data.get("totalPages", 1),
+                    "totalPaginas": data.get("totalPages", 1) or 1,
                 }
             if "items" in data:
                 return {
                     "data": data.get("items", []),
                     "totalRegistros": data.get("total", 0),
-                    "totalPaginas": data.get("pages", 1),
+                    "totalPaginas": data.get("pages", 1) or 1,
                 }
+            # Resposta desconhecida — loga chaves para debug
+            logger.warning(f"PNCP: estrutura de resposta desconhecida. Chaves: {list(data.keys())[:10]}")
         return {"data": [], "totalRegistros": 0, "totalPaginas": 0}
 
     async def coletar_licitacoes(
