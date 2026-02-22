@@ -1,4 +1,3 @@
-# collectors/pncp.py
 """
 Coletor PNCP - Portal Nacional de Contratações Públicas
 
