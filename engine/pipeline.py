@@ -82,13 +82,19 @@ class Pipeline:
                 situacao_cadastral = EXCLUDED.situacao_cadastral,
                 atualizado_em = NOW()
         """)
-        await self.db.execute(sql, {
-            k: empresa.get(k) for k in [
-                "cnpj", "razao_social", "nome_fantasia", "situacao_cadastral",
-                "data_abertura", "cnae_principal", "cnae_descricao", "natureza_juridica",
-                "porte", "capital_social", "logradouro", "municipio", "uf", "cep",
-            ]
-        })
+        params = {k: empresa.get(k) for k in [
+            "cnpj", "razao_social", "nome_fantasia", "situacao_cadastral",
+            "data_abertura", "cnae_principal", "cnae_descricao", "natureza_juridica",
+            "porte", "capital_social", "logradouro", "municipio", "uf", "cep",
+        ]}
+        # Converte data_abertura string para date (asyncpg exige date, não string)
+        if params.get("data_abertura") and isinstance(params["data_abertura"], str):
+            try:
+                from datetime import datetime
+                params["data_abertura"] = datetime.strptime(params["data_abertura"], "%Y-%m-%d").date()
+            except ValueError:
+                params["data_abertura"] = None
+        await self.db.execute(sql, params)
 
         await self.db.execute(
             text("DELETE FROM socios WHERE cnpj = :cnpj"),
@@ -318,10 +324,7 @@ class Pipeline:
                             # PNCP não tem data_publicacao distinta — não usar
                             # data_abertura como fallback ou todo score fica 15.
                             resultado = self.engine.analisar_licitacao(
-                                licitacao={
-                                    **lic_raw,
-                                    "data_publicacao": raw.get("dataPublicacao"),  # pode ser None
-                                },
+                                licitacao=lic_raw,  # data_publicacao não existe no PNCP — prazo score desabilitado intencionalmente
                                 participantes=participantes,
                                 empresas=empresas,
                                 socios_por_cnpj=socios_por_cnpj,
