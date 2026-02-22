@@ -9,6 +9,7 @@ import asyncio
 import httpx
 from datetime import date, timedelta
 from loguru import logger
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 # ENDPOINT CORRETO: "publicacao" (singular), não "publicacoes"
 ENDPOINT = "https://pncp.gov.br/api/consulta/v1/contratacoes/publicacao"
@@ -57,6 +58,11 @@ class PNCPCollector:
     async def __aexit__(self, *args):
         await self.client.aclose()
 
+    @retry(
+        stop=stop_after_attempt(5),
+        wait=wait_exponential(min=2, max=30),
+        retry=retry_if_exception_type((httpx.HTTPStatusError, httpx.TimeoutException))
+    )
     async def _get_pagina(self, params: dict) -> dict:
         try:
             logger.debug(f"PNCP params: {params}")
@@ -69,22 +75,31 @@ class PNCPCollector:
                     return self._normalizar_resposta(data)
                 except Exception as e:
                     logger.warning(f"PNCP JSON inválido: {e} | body={r.text[:300]}")
-                    return {"data": [], "totalRegistros": 0, "totalPaginas": 0}
+                    raise  # Retry se JSON falhar
 
-            if r.status_code == 204:
+            if r.status_code in (204, 404):
                 return {"data": [], "totalRegistros": 0, "totalPaginas": 0}
+
+            if r.status_code == 422:
+                logger.warning(f"PNCP 422 - Período grande | body={r.text[:300]}")
+                return {"data": [], "totalRegistros": 0, "totalPaginas": 0}  # Handle gracefully
+
+            if r.status_code == 500:
+                logger.warning(f"PNCP 500 - Retry | body={r.text[:300]}")
+                raise httpx.HTTPStatusError("Retry 500", request=r.request, response=r)  # Force retry
 
             logger.warning(f"PNCP HTTP {r.status_code} | body={r.text[:300]}")
             return {"data": [], "totalRegistros": 0, "totalPaginas": 0}
 
         except httpx.TimeoutException as e:
-            logger.warning(f"PNCP timeout: {e}")
+            logger.warning(f"PNCP timeout: {e} - Retry")
+            raise
         except httpx.ConnectError as e:
-            logger.warning(f"PNCP ConnectError: {e}")
+            logger.warning(f"PNCP ConnectError: {e} - Retry")
+            raise
         except Exception as e:
             logger.warning(f"PNCP {type(e).__name__}: {e}")
-
-        return {"data": [], "totalRegistros": 0, "totalPaginas": 0}
+            raise  # Retry genérico
 
     def _normalizar_resposta(self, data) -> dict:
         if data is None:
