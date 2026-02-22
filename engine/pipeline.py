@@ -94,6 +94,18 @@ class Pipeline:
                 params["data_abertura"] = datetime.strptime(params["data_abertura"], "%Y-%m-%d").date()
             except ValueError:
                 params["data_abertura"] = None
+
+        # cnae_principal vem como int da Receita Federal — converte para string
+        if params.get("cnae_principal") is not None:
+            params["cnae_principal"] = str(params["cnae_principal"])
+
+        # capital_social pode vir como int — converte para garantir
+        if params.get("capital_social") is not None:
+            try:
+                params["capital_social"] = float(params["capital_social"])
+            except (ValueError, TypeError):
+                params["capital_social"] = None
+
         await self.db.execute(sql, params)
 
         await self.db.execute(
@@ -324,7 +336,16 @@ class Pipeline:
                             # PNCP não tem data_publicacao distinta — não usar
                             # data_abertura como fallback ou todo score fica 15.
                             resultado = self.engine.analisar_licitacao(
-                                licitacao=lic_raw,  # data_publicacao não existe no PNCP — prazo score desabilitado intencionalmente
+                                licitacao={
+                                    **lic_raw,
+                                    # Se tem cnpj_fornecedor é contrato assinado (1 vencedor é normal).
+                                    # Só aplicar flag participante_unico em editais com numero_participantes real.
+                                    "numero_participantes": (
+                                        lic_raw.get("numero_participantes")
+                                        if not lic_raw.get("cnpj_fornecedor")
+                                        else None  # contrato: não sinalizar como participante único
+                                    ),
+                                },
                                 participantes=participantes,
                                 empresas=empresas,
                                 socios_por_cnpj=socios_por_cnpj,
