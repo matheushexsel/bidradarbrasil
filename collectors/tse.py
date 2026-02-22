@@ -1,4 +1,3 @@
-# collectors/tse.py
 """
 Coletor TSE - Candidaturas, Bens e Doações de Campanha
 Dados: https://dadosabertos.tse.jus.br/
