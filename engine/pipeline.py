@@ -399,6 +399,12 @@ class Pipeline:
                             )
                             import traceback
                             logger.debug(traceback.format_exc())
+                            # Rollback obrigatório — sem isso a transação fica em estado
+                            # 'aborted' e todas as queries seguintes falham em cascata
+                            try:
+                                await self.db.rollback()
+                            except Exception:
+                                pass
                             continue
 
                     await self.db.commit()
