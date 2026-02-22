@@ -1,3 +1,4 @@
+# collectors/pncp.py
 """
 Coletor PNCP - Portal Nacional de Contratações Públicas
 
@@ -59,6 +60,7 @@ class PNCPCollector:
 
     async def _get_pagina(self, params: dict) -> dict:
         try:
+            logger.debug(f"PNCP params: {params}")
             r = await self.client.get(ENDPOINT, params=params)
             logger.debug(f"PNCP HTTP {r.status_code} | params={params}")
 
@@ -166,7 +168,7 @@ class PNCPCollector:
             f"Período: {data_inicial} → {data_final}"
         )
 
-        params = {
+        params_base = {
             "dataInicial": data_inicial.strftime("%Y%m%d"),
             "dataFinal": data_final.strftime("%Y%m%d"),
             "pagina": 1,
@@ -175,39 +177,46 @@ class PNCPCollector:
 
         # A API aceita filtro por UF diretamente
         if uf:
-            params["uf"] = uf.upper()
+            params_base["uf"] = uf.upper()
         if codigo_ibge:
-            params["codigoMunicipioIbge"] = codigo_ibge
+            params_base["codigoMunicipioIbge"] = codigo_ibge
 
-        primeira = await self._get_pagina(params)
-        total_paginas = max(primeira.get("totalPaginas", 1) or 1, 1)
-        total_registros = primeira.get("totalRegistros", 0)
+        licitacoes = []
+        modalidades = list(MODALIDADES_MAP.keys())  # Coletar todas as modalidades
 
-        logger.info(
-            f"PNCP UF={uf}: {total_registros} registros em {total_paginas} páginas"
-        )
+        for mod in modalidades:
+            params = params_base.copy()
+            params["codigoModalidadeContratacao"] = mod
 
-        licitacoes = [
-            self.normalizar_licitacao(r)
-            for r in primeira.get("data", []) if r
-        ]
+            primeira = await self._get_pagina(params)
+            total_paginas = max(primeira.get("totalPaginas", 1) or 1, 1)
+            total_registros = primeira.get("totalRegistros", 0)
 
-        # Busca páginas restantes em paralelo (lotes de 5)
-        paginas_restantes = list(range(2, min(total_paginas + 1, 201)))
-        for i in range(0, len(paginas_restantes), 5):
-            tasks = [
-                self._get_pagina({**params, "pagina": p})
-                for p in paginas_restantes[i:i + 5]
-            ]
-            respostas = await asyncio.gather(*tasks, return_exceptions=True)
-            for resp in respostas:
-                if isinstance(resp, Exception):
-                    continue
-                licitacoes.extend([
-                    self.normalizar_licitacao(r)
-                    for r in resp.get("data", []) if r
-                ])
-            await asyncio.sleep(0.5)
+            logger.info(
+                f"PNCP UF={uf} Modalidade={mod}: {total_registros} registros em {total_paginas} páginas"
+            )
+
+            licitacoes.extend([
+                self.normalizar_licitacao(r)
+                for r in primeira.get("data", []) if r
+            ])
+
+            # Busca páginas restantes em paralelo (lotes de 5)
+            paginas_restantes = list(range(2, min(total_paginas + 1, 201)))
+            for i in range(0, len(paginas_restantes), 5):
+                tasks = [
+                    self._get_pagina({**params, "pagina": p})
+                    for p in paginas_restantes[i:i + 5]
+                ]
+                respostas = await asyncio.gather(*tasks, return_exceptions=True)
+                for resp in respostas:
+                    if isinstance(resp, Exception):
+                        continue
+                    licitacoes.extend([
+                        self.normalizar_licitacao(r)
+                        for r in resp.get("data", []) if r
+                    ])
+                await asyncio.sleep(0.5)
 
         logger.info(f"Coleta PNCP concluída: {len(licitacoes)} licitações | UF={uf}")
         return licitacoes
