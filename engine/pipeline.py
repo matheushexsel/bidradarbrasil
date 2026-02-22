@@ -4,7 +4,8 @@ Orquestra coleta → enriquecimento → análise → persistência.
 """
 
 import asyncio
-from datetime import date, timedelta, datetime
+import json
+from datetime import datetime
 from loguru import logger
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
@@ -42,32 +43,52 @@ class Pipeline:
             )
             ON CONFLICT (numero_controle) DO UPDATE SET
                 valor_homologado = EXCLUDED.valor_homologado,
-                situacao = EXCLUDED.situacao,
-                numero_participantes = EXCLUDED.numero_participantes,
-                atualizado_em = NOW()
+                situacao         = EXCLUDED.situacao,
+                atualizado_em    = NOW()
             RETURNING id
         """)
-        import json
-        params = {**dados}
-        if "raw_data" in params and params["raw_data"] is not None:
-            params["raw_data"] = json.dumps(params["raw_data"])
+
+        CAMPOS_TABELA = {
+            "fonte", "numero_controle", "orgao_cnpj", "orgao_nome", "orgao_esfera",
+            "orgao_uf", "orgao_municipio", "orgao_codigo_ibge", "modalidade",
+            "tipo_objeto", "objeto_descricao", "objeto_categoria", "valor_estimado",
+            "valor_homologado", "data_abertura", "data_homologacao", "situacao",
+            "numero_participantes", "raw_data",
+        }
+        params = {k: dados.get(k) for k in CAMPOS_TABELA}
+
+        if params.get("raw_data") is not None and not isinstance(params["raw_data"], str):
+            params["raw_data"] = json.dumps(params["raw_data"], ensure_ascii=False)
+
         params.setdefault("objeto_categoria", None)
         params.setdefault("numero_participantes", None)
 
+        for campo_data in ("data_abertura", "data_homologacao"):
+            v = params.get(campo_data)
+            if v and isinstance(v, str):
+                for fmt in ("%Y-%m-%d", "%d/%m/%Y"):
+                    try:
+                        params[campo_data] = datetime.strptime(v, fmt).date()
+                        break
+                    except ValueError:
+                        pass
+                else:
+                    logger.warning(f"Data inválida '{v}' em {campo_data} — ignorando")
+                    params[campo_data] = None
+
         try:
-            if params.get("data_abertura") and isinstance(params["data_abertura"], str):
-                params["data_abertura"] = datetime.strptime(params["data_abertura"], '%Y-%m-%d').date()
-            if params.get("data_homologacao") and isinstance(params["data_homologacao"], str):
-                params["data_homologacao"] = datetime.strptime(params["data_homologacao"], '%Y-%m-%d').date()
-        except ValueError as e:
-            logger.warning(f"Data inválida na licitação {params.get('numero_controle')}: {e} – Skipando")
+            result = await self.db.execute(sql, params)
+            row = result.fetchone()
+            return str(row[0]) if row else None
+        except Exception as e:
+            logger.error(f"Erro upsert licitacao {params.get('numero_controle')}: {e}")
             return None
 
-        result = await self.db.execute(sql, params)
-        row = result.fetchone()
-        return str(row[0]) if row else None
-
     async def _upsert_empresa(self, empresa: dict):
+        """
+        Persiste empresa. Tipos já vêm corretos do CNPJCollector._normalizar():
+        cnae_principal: str, data_abertura: date|None, capital_social: float|None
+        """
         sql = text("""
             INSERT INTO empresas (
                 cnpj, razao_social, nome_fantasia, situacao_cadastral,
@@ -79,46 +100,62 @@ class Pipeline:
                 :porte, :capital_social, :logradouro, :municipio, :uf, :cep
             )
             ON CONFLICT (cnpj) DO UPDATE SET
+                razao_social       = EXCLUDED.razao_social,
                 situacao_cadastral = EXCLUDED.situacao_cadastral,
-                atualizado_em = NOW()
+                cnae_principal     = EXCLUDED.cnae_principal,
+                cnae_descricao     = EXCLUDED.cnae_descricao,
+                capital_social     = EXCLUDED.capital_social,
+                atualizado_em      = NOW()
         """)
         params = {k: empresa.get(k) for k in [
             "cnpj", "razao_social", "nome_fantasia", "situacao_cadastral",
             "data_abertura", "cnae_principal", "cnae_descricao", "natureza_juridica",
             "porte", "capital_social", "logradouro", "municipio", "uf", "cep",
         ]}
-        # Converte data_abertura string para date (asyncpg exige date, não string)
-        if params.get("data_abertura") and isinstance(params["data_abertura"], str):
-            try:
-                from datetime import datetime
-                params["data_abertura"] = datetime.strptime(params["data_abertura"], "%Y-%m-%d").date()
-            except ValueError:
-                params["data_abertura"] = None
 
-        # cnae_principal vem como int da Receita Federal — converte para string
+        # Defensive type guarantees (cnpj.py já entrega certo, mas por segurança)
         if params.get("cnae_principal") is not None:
             params["cnae_principal"] = str(params["cnae_principal"])
-
-        # capital_social pode vir como int — converte para garantir
         if params.get("capital_social") is not None:
             try:
                 params["capital_social"] = float(params["capital_social"])
             except (ValueError, TypeError):
                 params["capital_social"] = None
+        if params.get("data_abertura") and isinstance(params["data_abertura"], str):
+            for fmt in ("%Y-%m-%d", "%d/%m/%Y"):
+                try:
+                    params["data_abertura"] = datetime.strptime(params["data_abertura"], fmt).date()
+                    break
+                except ValueError:
+                    pass
+            else:
+                params["data_abertura"] = None
 
         await self.db.execute(sql, params)
 
-        await self.db.execute(
-            text("DELETE FROM socios WHERE cnpj = :cnpj"),
-            {"cnpj": empresa["cnpj"]},
-        )
+        cnpj = empresa.get("cnpj", "")
+        await self.db.execute(text("DELETE FROM socios WHERE cnpj = :cnpj"), {"cnpj": cnpj})
+
         for socio in empresa.get("socios", []):
+            s = dict(socio)
+            if s.get("data_entrada") and isinstance(s["data_entrada"], str):
+                for fmt in ("%Y-%m-%d", "%d/%m/%Y"):
+                    try:
+                        s["data_entrada"] = datetime.strptime(s["data_entrada"], fmt).date()
+                        break
+                    except ValueError:
+                        pass
+                else:
+                    s["data_entrada"] = None
             await self.db.execute(
                 text("""
-                    INSERT INTO socios (cnpj, cpf_cnpj_socio, nome_socio, nome_normalizado, qualificacao, data_entrada)
-                    VALUES (:cnpj, :cpf_cnpj_socio, :nome_socio, :nome_normalizado, :qualificacao, :data_entrada)
+                    INSERT INTO socios
+                        (cnpj, cpf_cnpj_socio, nome_socio, nome_normalizado, qualificacao, data_entrada)
+                    VALUES
+                        (:cnpj, :cpf_cnpj_socio, :nome_socio, :nome_normalizado, :qualificacao, :data_entrada)
+                    ON CONFLICT DO NOTHING
                 """),
-                socio,
+                s,
             )
 
     async def _upsert_politico(self, politico: dict):
@@ -133,11 +170,12 @@ class Pipeline:
                 :ano_eleicao, :patrimonio_declarado
             )
             ON CONFLICT (cpf) DO UPDATE SET
-                nome = EXCLUDED.nome,
-                cargo = EXCLUDED.cargo,
-                eleito = EXCLUDED.eleito,
+                nome                 = EXCLUDED.nome,
+                cargo                = EXCLUDED.cargo,
+                eleito               = EXCLUDED.eleito,
                 patrimonio_declarado = EXCLUDED.patrimonio_declarado,
-                atualizado_em = NOW()
+                partido              = EXCLUDED.partido,
+                atualizado_em        = NOW()
         """)
         await self.db.execute(sql, {
             k: politico.get(k) for k in [
@@ -148,44 +186,45 @@ class Pipeline:
         })
 
     async def _salvar_participante(self, licitacao_id: str, p: dict):
-        sql = text("""
-            INSERT INTO licitacao_participantes (licitacao_id, cnpj, razao_social, vencedor, valor_proposta)
-            VALUES (:licitacao_id, :cnpj, :razao_social, :vencedor, :valor_proposta)
-            ON CONFLICT DO NOTHING
-        """)
-        await self.db.execute(sql, {
-            "licitacao_id": licitacao_id,
-            "cnpj": p.get("cnpj", ""),
-            "razao_social": p.get("razao_social", ""),
-            "vencedor": p.get("vencedor", False),
-            "valor_proposta": p.get("valor_proposta"),
-        })
+        await self.db.execute(
+            text("""
+                INSERT INTO licitacao_participantes
+                    (licitacao_id, cnpj, razao_social, vencedor, valor_proposta)
+                VALUES
+                    (:licitacao_id, :cnpj, :razao_social, :vencedor, :valor_proposta)
+                ON CONFLICT (licitacao_id, cnpj) DO NOTHING
+            """),
+            {
+                "licitacao_id":   licitacao_id,
+                "cnpj":           p.get("cnpj", ""),
+                "razao_social":   p.get("razao_social", ""),
+                "vencedor":       p.get("vencedor", False),
+                "valor_proposta": p.get("valor_proposta"),
+            },
+        )
 
     async def _salvar_resultado_analise(self, licitacao_id: str, resultado):
-        import json
         sql = text("""
             UPDATE licitacoes SET
-                score_risco = :score,
-                score_detalhes = :detalhes,
-                objeto_categoria = :categoria,
-                flag_preco_anomalo = :flag_preco,
-                flag_relacionamento = :flag_rel,
-                flag_objeto_inadequado = :flag_obj,
-                flag_participante_unico = :flag_part,
-                flag_prazo_suspeito = :flag_prazo,
-                atualizado_em = NOW()
+                score_risco             = :score,
+                score_detalhes          = :detalhes,
+                objeto_categoria        = :categoria,
+                flag_preco_anomalo      = :flag_preco,
+                flag_relacionamento     = :flag_rel,
+                flag_objeto_inadequado  = :flag_obj,
+                flag_participante_unico = FALSE,
+                flag_prazo_suspeito     = FALSE,
+                atualizado_em           = NOW()
             WHERE id = :id
         """)
         await self.db.execute(sql, {
-            "id": licitacao_id,
-            "score": resultado.score_total,
-            "detalhes": json.dumps(resultado.score_detalhes),
-            "categoria": resultado.score_detalhes.get("categoria_objeto"),
+            "id":         licitacao_id,
+            "score":      resultado.score_total,
+            "detalhes":   json.dumps(resultado.score_detalhes, ensure_ascii=False),
+            "categoria":  resultado.score_detalhes.get("categoria_objeto"),
             "flag_preco": resultado.flags.get("flag_preco_anomalo", False),
-            "flag_rel": resultado.flags.get("flag_relacionamento", False),
-            "flag_obj": resultado.flags.get("flag_objeto_inadequado", False),
-            "flag_part": resultado.flags.get("flag_participante_unico", False),
-            "flag_prazo": resultado.flags.get("flag_prazo_suspeito", False),
+            "flag_rel":   resultado.flags.get("flag_relacionamento", False),
+            "flag_obj":   resultado.flags.get("flag_objeto_inadequado", False),
         })
 
         for relacao in resultado.anomalias_relacao:
@@ -200,15 +239,15 @@ class Pipeline:
                     )
                 """),
                 {
-                    "licitacao_id": licitacao_id,
-                    "tipo_relacao": relacao.tipo,
-                    "nome_socio": relacao.nome_socio,
-                    "nome_politico": relacao.nome_politico,
+                    "licitacao_id":   licitacao_id,
+                    "tipo_relacao":   relacao.tipo,
+                    "nome_socio":     relacao.nome_socio,
+                    "nome_politico":  relacao.nome_politico,
                     "cargo_politico": relacao.cargo_politico,
-                    "uf_politico": relacao.uf_politico,
-                    "tipo_vinculo": relacao.tipo,
-                    "similaridade": relacao.similaridade,
-                    "evidencia": relacao.evidencia,
+                    "uf_politico":    relacao.uf_politico,
+                    "tipo_vinculo":   relacao.tipo,
+                    "similaridade":   relacao.similaridade,
+                    "evidencia":      relacao.evidencia,
                 },
             )
 
@@ -216,10 +255,10 @@ class Pipeline:
         result = await self.db.execute(
             text("""
                 SELECT valor_homologado FROM licitacoes
-                WHERE objeto_categoria = :cat
-                AND orgao_uf = :uf
-                AND valor_homologado IS NOT NULL
-                AND valor_homologado > 0
+                WHERE objeto_categoria  = :cat
+                  AND orgao_uf          = :uf
+                  AND valor_homologado IS NOT NULL
+                  AND valor_homologado  > 0
                 ORDER BY data_abertura DESC
                 LIMIT 200
             """),
@@ -239,24 +278,27 @@ class Pipeline:
     ):
         logger.info(f"=== PIPELINE INICIADO | UF={uf} | IBGE={codigo_ibge} ===")
 
-        # 1. Carrega políticos da UF (com concorrência limitada para não throttlar TSE)
-        politicos = []
-        doacoes = []
+        # 1. Políticos via TSE
+        politicos: list[dict] = []
+        doacoes:   list[dict] = []
         if uf:
             try:
                 async with TSECollector() as tse:
                     dados_tse = await tse.coletar_uf_completo(uf)
-                    politicos = dados_tse["politicos"]
-                    doacoes = dados_tse["doacoes"]
+                    politicos = dados_tse.get("politicos", [])
+                    doacoes   = dados_tse.get("doacoes", [])
 
+                if politicos:
                     for p in politicos:
                         await self._upsert_politico(p)
                     await self.db.commit()
-                    logger.info(f"Políticos persistidos: {len(politicos)}")
+                    logger.info(f"Políticos persistidos: {len(politicos)} | Doações: {len(doacoes)}")
+                else:
+                    logger.warning(f"TSE retornou 0 políticos para UF={uf}")
             except Exception as e:
                 logger.warning(f"TSE falhou para UF={uf}: {e} — continuando sem dados TSE")
 
-        # 2. Coleta licitações
+        # 2. Licitações do PNCP
         async with PNCPCollector(self.db) as pncp:
             licitacoes_raw = await pncp.coletar_tudo(
                 uf=uf,
@@ -265,87 +307,78 @@ class Pipeline:
             )
 
         logger.info(f"Licitações coletadas: {len(licitacoes_raw)}")
+        if not licitacoes_raw:
+            logger.warning("Nenhuma licitação coletada — abortando")
+            return {"total_licitacoes": 0, "total_anomalias": 0}
+
+        com_cnpj = sum(1 for l in licitacoes_raw if l.get("cnpj_fornecedor"))
+        logger.info(f"Com CNPJ fornecedor: {com_cnpj}/{len(licitacoes_raw)}")
 
         # 3. Processa em lotes
         BATCH = 20
         total_anomalias = 0
+        total_empresas  = 0
+        total_sem_cnpj  = 0
 
         async with CNPJCollector() as cnpj_col:
             async with CGUCollector() as cgu:
                 for i in range(0, len(licitacoes_raw), BATCH):
-                    lote = licitacoes_raw[i:i+BATCH]
+                    lote = licitacoes_raw[i : i + BATCH]
 
                     for lic_raw in lote:
                         try:
-                            # Remove campos extras que não existem na tabela
-                            # (cnpj_fornecedor e nome_fornecedor são usados pelo pipeline
-                            # mas não fazem parte do schema de licitacoes)
-                            dados_db = {
-                                k: v for k, v in lic_raw.items()
-                                if k not in ("cnpj_fornecedor", "nome_fornecedor", "numero_controle_contrato")
-                            }
-                            lid = await self._upsert_licitacao(dados_db)
+                            lid = await self._upsert_licitacao(lic_raw)
                             if not lid:
                                 continue
 
                             lic_raw["id"] = lid
-                            categoria = self.engine.categorizar_objeto(
-                                lic_raw.get("objeto_descricao", "")
-                            )
 
-                            # cnpj_fornecedor já vem normalizado pelo PNCPCollector
-                            # (vem do /contratos — empresa que assinou o contrato)
-                            participantes = []
-                            vencedor_cnpj = lic_raw.get("cnpj_fornecedor", "")
-                            vencedor_nome = lic_raw.get("nome_fornecedor", "")
+                            # Vencedor vem direto do PNCPCollector (normalizar_contrato)
+                            participantes: list[dict] = []
+                            vencedor_cnpj = (lic_raw.get("cnpj_fornecedor") or "").strip()
+                            vencedor_nome = (lic_raw.get("nome_fornecedor") or "").strip()
 
                             if vencedor_cnpj:
                                 participantes.append({
-                                    "cnpj": vencedor_cnpj,
-                                    "razao_social": vencedor_nome,
-                                    "vencedor": True,
+                                    "cnpj":           vencedor_cnpj,
+                                    "razao_social":   vencedor_nome,
+                                    "vencedor":       True,
                                     "valor_proposta": lic_raw.get("valor_homologado"),
                                 })
+                            else:
+                                total_sem_cnpj += 1
 
-                            # Enriquece empresas
-                            cnpjs = [p["cnpj"] for p in participantes if p.get("cnpj")]
-                            empresas = {}
-                            socios_por_cnpj = {}
-                            sancoes_por_cnpj = {}
+                            empresas:         dict = {}
+                            socios_por_cnpj:  dict = {}
+                            sancoes_por_cnpj: dict = {}
 
-                            for cnpj in cnpjs:
+                            for p in participantes:
+                                cnpj = p.get("cnpj", "")
+                                if not cnpj:
+                                    continue
+
                                 empresa = await cnpj_col.buscar_empresa(cnpj)
                                 if empresa:
                                     await self._upsert_empresa(empresa)
-                                    empresas[cnpj] = empresa
+                                    empresas[cnpj]        = empresa
                                     socios_por_cnpj[cnpj] = empresa.get("socios", [])
+                                    total_empresas += 1
+                                    logger.debug(f"Empresa: {cnpj} {empresa.get('razao_social','')}")
 
                                 sancao = await cgu.verificar_cnpj(cnpj)
                                 sancoes_por_cnpj[cnpj] = sancao
 
-                                for p in participantes:
-                                    if p["cnpj"] == cnpj:
-                                        await self._salvar_participante(lid, p)
+                                await self._salvar_participante(lid, p)
 
+                            categoria = self.engine.categorizar_objeto(
+                                lic_raw.get("objeto_descricao", "")
+                            )
                             historico = await self._buscar_historico_precos(
                                 categoria, lic_raw.get("orgao_uf", "")
                             )
 
-                            # *** FIX SCORE = 15 ***
-                            # Passa data_publicacao separada de data_abertura.
-                            # PNCP não tem data_publicacao distinta — não usar
-                            # data_abertura como fallback ou todo score fica 15.
                             resultado = self.engine.analisar_licitacao(
-                                licitacao={
-                                    **lic_raw,
-                                    # Se tem cnpj_fornecedor é contrato assinado (1 vencedor é normal).
-                                    # Só aplicar flag participante_unico em editais com numero_participantes real.
-                                    "numero_participantes": (
-                                        lic_raw.get("numero_participantes")
-                                        if not lic_raw.get("cnpj_fornecedor")
-                                        else None  # contrato: não sinalizar como participante único
-                                    ),
-                                },
+                                licitacao=lic_raw,
                                 participantes=participantes,
                                 empresas=empresas,
                                 socios_por_cnpj=socios_por_cnpj,
@@ -361,15 +394,27 @@ class Pipeline:
                             await self._salvar_resultado_analise(lid, resultado)
 
                         except Exception as e:
-                            logger.error(f"Erro processando licitação: {e}")
+                            logger.error(
+                                f"Erro licitação {lic_raw.get('numero_controle','?')}: {e}"
+                            )
+                            import traceback
+                            logger.debug(traceback.format_exc())
                             continue
 
                     await self.db.commit()
-                    logger.info(f"Lote {i//BATCH + 1}/{(len(licitacoes_raw)-1)//BATCH + 1} concluído")
+                    logger.info(
+                        f"Lote {i // BATCH + 1}/{(len(licitacoes_raw) - 1) // BATCH + 1} | "
+                        f"empresas={total_empresas} sem_cnpj={total_sem_cnpj}"
+                    )
                     await asyncio.sleep(0.3)
 
-        logger.info(f"=== PIPELINE CONCLUÍDO | {len(licitacoes_raw)} licitações | {total_anomalias} com anomalias ===")
+        logger.info(
+            f"=== PIPELINE CONCLUÍDO | {len(licitacoes_raw)} licitações | "
+            f"{total_anomalias} anomalias | {total_empresas} empresas | "
+            f"{len(politicos)} políticos | {total_sem_cnpj} sem CNPJ ==="
+        )
         return {
             "total_licitacoes": len(licitacoes_raw),
-            "total_anomalias": total_anomalias,
+            "total_anomalias":  total_anomalias,
+            "total_empresas":   total_empresas,
         }

@@ -1,636 +1,532 @@
 """
-ENGINE DE ANÁLISE - Coração do sistema.
-
-Três eixos de detecção:
-1. PREÇO  → valor está fora do padrão histórico/mercado?
-2. RELAÇÃO → empresa tem vínculo com político da região?
-3. OBJETO  → CNAE da empresa condiz com o objeto licitado?
-
-Cada anomalia gera um score parcial. Score final = soma ponderada.
+ENGINE DE ANÁLISE
+Classifica objetos, detecta anomalias e calcula scores de risco.
 """
 
-import re
 import unicodedata
 from dataclasses import dataclass, field
-from typing import Optional
+from statistics import median
 from loguru import logger
 
 
-# ============================================================
-# SCORES (pesos de cada anomalia no score final)
-# ============================================================
-
+# ----------------------------------------------------------
+# SCORES (pontos por anomalia)
+# ----------------------------------------------------------
 SCORES = {
-    "preco_acima_3x":          40,
-    "preco_acima_2x":          25,
-    "preco_acima_1_5x":        15,
-    "participante_unico":      20,
-    "empresa_aberta_recente":  20,
-    "empresa_sanctionada":     35,
-    "cnae_divergente":         25,
-    "sobrenome_identico":      35,
-    "cpf_direto":              50,
-    "doador_campanha":         30,
-    "prazo_edital_curto":      15,   # edital publicado < 3 dias antes do prazo
-    "objeto_generico":         10,   # descrição vaga demais
+    # Preço
+    "preco_acima_1_5x": 15,
+    "preco_acima_2x":   25,
+    "preco_acima_3x":   40,
+    # Relacionamento político
+    "sobrenome_coincide":    35,
+    "cpf_direto":            50,
+    "doacao_campanha":       30,
+    # Empresa
+    "empresa_sancionada":    35,
+    "cnae_incompativel":     25,
+    # Prazo — desabilitado pois PNCP não fornece data_publicacao separada
+    # "prazo_edital_curto": 15,
 }
 
-# ============================================================
-# MAPEAMENTO CNAE → CATEGORIAS DE OBJETO
-# ============================================================
-
-# key = categoria normalizada | value = lista de prefixos CNAE válidos
-CNAE_POR_CATEGORIA = {
-    "OBRAS_CONSTRUCAO": ["41", "42", "43"],
-    "TECNOLOGIA_TI": ["62", "63"],
-    "SAUDE_EQUIPAMENTOS": ["32.5", "46.4", "47.4"],
-    "SAUDE_SERVICOS": ["86", "87", "88"],
-    "ALIMENTACAO": ["10", "11", "56", "47.2"],
-    "LIMPEZA_CONSERVACAO": ["81.2"],
-    "SEGURANCA": ["80.1"],
-    "CONSULTORIA": ["69", "70", "71", "73", "74"],
-    "TRANSPORTE": ["49", "50", "51"],
-    "EDUCACAO": ["85"],
-    "COMBUSTIVEL": ["47.3", "46.8"],
-    "MOBILIARIO": ["31", "46.5"],
-    "MEDICAMENTOS": ["21", "46.4"],
-    "PUBLICIDADE": ["73.1"],
-    "EVENTOS": ["82.3", "90", "91"],
-}
-
-# Palavras-chave no objeto → categoria
-PALAVRAS_CATEGORIA = {
-    "OBRAS_CONSTRUCAO": [
-        "obra", "construção", "reforma", "pavimentação", "infraestrutura",
-        "edificação", "engenharia", "calçada", "drenagem", "saneamento",
+# ----------------------------------------------------------
+# CATEGORIAS DE OBJETO
+# Ordem importa: mais específico primeiro
+# ----------------------------------------------------------
+CATEGORIAS = {
+    "SAUDE": [
+        "medicamento", "farmacia", "remedio", "vacina", "insumo farmaceutico",
+        "material hospitalar", "material medico", "equipamento medico",
+        "equipamento hospitalar", "ambulancia", "odontologico", "odontologia",
+        "dental", "protese", "ortopedico", "laboratorial", "laboratorio",
+        "saneamento", "saude", "enfermagem", "cirurgico", "hospitalar",
+        "material de saude", "produto de saude", "kit medico", "kit hospitalar",
+        "leito", "upa", "sus", "ubs", "vigilancia sanitaria",
+        "exame", "consulta medica", "internacao", "tratamento medico",
+        "residuos de saude", "epi", "equipamento de protecao",
+        "material odontologico", "insumo odontologico", "equipamento odontologico",
+    ],
+    "OBRAS": [
+        "obra", "construcao", "reforma", "ampliacao", "pavimentacao",
+        "asfalto", "calcamento", "drenagem", "esgoto", "saneamento basico",
+        "engenharia", "infraestrutura", "ponte", "viaduto", "galeria",
+        "alvenaria", "fundacao", "estrutura", "cobertura", "telhado",
+        "pintura predial", "revitalizacao", "restauracao predial",
+        "piso", "revestimento", "demolição", "terraplenagem",
+    ],
+    "SERVICOS": [
+        "servico", "manutencao", "limpeza", "conservacao", "vigilancia",
+        "seguranca", "portaria", "recepcionista", "motorista", "transporte",
+        "jardinagem", "paisagismo", "dedetizacao", "desinsetizacao",
+        "lavanderia", "cozinheiro", "copeiro", "garçom", "auxiliar",
+        "assistencia tecnica", "suporte tecnico", "helpdesk",
+        "locacao de mao de obra", "terceirizacao",
+        "coleta de lixo", "gestao de residuos",
+        "prestacao de servicos", "fornecimento de mao de obra",
     ],
     "TECNOLOGIA_TI": [
-        "software", "sistema", "tecnologia", "ti", "hardware", "computador",
-        "servidor", "rede", "informática", "licença", "suporte técnico",
-    ],
-    "SAUDE_EQUIPAMENTOS": [
-        "equipamento médico", "hospitalar", "odontológico", "ambulância",
-        "leito", "uti", "laboratório",
-    ],
-    "SAUDE_SERVICOS": [
-        "saúde", "médico", "enfermagem", "upa", "hospital", "sus",
-        "consulta", "exame", "cirurgia",
+        "software", "hardware", "sistema de informacao", "tecnologia da informacao",
+        "ti ", " ti,", "computador", "notebook", "servidor", "rede",
+        "infraestrutura de ti", "datacenter", "licenca de software",
+        "sistema informatizado", "suporte de ti", "desenvolvimento de sistema",
+        "aplicativo", "aplicacao web", "portal web", "site",
+        "telecomunicacao", "internet", "fibra optica", "link de internet",
+        "impressora", "scanner", "nobreak", "storage", "backup",
+        "seguranca da informacao", "firewall",
     ],
     "ALIMENTACAO": [
-        "alimento", "merenda", "refeição", "gênero alimentício", "cesta",
-        "alimentação escolar", "lanche",
-    ],
-    "LIMPEZA_CONSERVACAO": [
-        "limpeza", "conservação", "zeladoria", "higienização", "coleta",
-    ],
-    "SEGURANCA": [
-        "segurança", "vigilância", "monitoramento", "câmera",
-    ],
-    "CONSULTORIA": [
-        "consultoria", "assessoria", "elaboração de plano", "planejamento",
-        "diagnóstico", "auditoria", "contabilidade", "advocacia",
-    ],
-    "TRANSPORTE": [
-        "transporte", "veículo", "ônibus", "frete", "logística", "ambulância",
+        "alimentacao", "alimento", "merenda", "genero alimenticio",
+        "produto alimenticio", "refeicao", "cesta basica", "kit alimentar",
+        "gênero alimenticio", "mantimento", "hortifruti", "fruta", "verdura",
+        "legume", "carne", "frango", "peixe", "laticinio", "leite",
+        "pao", "padaria", "suco", "agua mineral", "cafe", "açucar",
     ],
     "EDUCACAO": [
-        "educação", "ensino", "escola", "material didático", "capacitação",
-        "treinamento", "curso",
+        "educacao", "ensino", "escola", "professor", "material escolar",
+        "material didatico", "livro didatico", "uniforme escolar",
+        "mochila escolar", "capacitacao", "treinamento", "curso",
+        "formacao", "qualificacao profissional", "bolsa de estudo",
+        "creche", "pre-escola", "educacao infantil", "alfabetizacao",
     ],
-    "COMBUSTIVEL": [
-        "combustível", "gasolina", "diesel", "álcool", "etanol", "lubrificante",
+    "VEICULOS": [
+        "veiculo", "onibus", "caminhao", "van", "carro", "automovel",
+        "moto", "motocicleta", "frota", "combustivel", "gasolina",
+        "diesel", "etanol", "peca automotiva", "pneu", "borracha",
+        "locacao de veiculo", "aluguel de veiculo",
     ],
     "MOBILIARIO": [
-        "mobiliário", "móvel", "cadeira", "mesa", "armário", "estante",
+        "mobiliario", "movel", "cadeira", "mesa", "armario", "estante",
+        "arquivo", "gaveta", "sofá", "poltrona", "banco",
+        "equipamento de escritorio", "material de escritorio",
     ],
-    "MEDICAMENTOS": [
-        "medicamento", "remédio", "farmácia", "insumo farmacêutico",
-    ],
-    "PUBLICIDADE": [
-        "publicidade", "propaganda", "comunicação", "mídia", "jornal",
-        "anúncio", "divulgação",
-    ],
-    "EVENTOS": [
-        "evento", "cerimônia", "show", "espetáculo", "festa", "solenidade",
+    "LICITACAO_PUBLICA": [
+        # Fallback genérico para contratos governamentais sem categoria clara
     ],
 }
 
+# Mapeamento CNAE → categoria compatível
+# Chave: prefixo CNAE (4 dígitos), valor: lista de categorias compatíveis
+CNAE_CATEGORIAS = {
+    # Saúde
+    "4644": ["SAUDE"],
+    "4645": ["SAUDE"],
+    "4646": ["SAUDE"],
+    "4771": ["SAUDE", "FARMACIA"],
+    "8610": ["SAUDE"],
+    "8621": ["SAUDE"],
+    "8622": ["SAUDE"],
+    "8630": ["SAUDE"],
+    "8640": ["SAUDE"],
+    "8650": ["SAUDE"],
+    "8660": ["SAUDE"],
+    # Construção/Obras
+    "4120": ["OBRAS"],
+    "4211": ["OBRAS"],
+    "4212": ["OBRAS"],
+    "4213": ["OBRAS"],
+    "4221": ["OBRAS"],
+    "4222": ["OBRAS"],
+    "4291": ["OBRAS"],
+    "4292": ["OBRAS"],
+    "4299": ["OBRAS"],
+    "4311": ["OBRAS"],
+    "4312": ["OBRAS"],
+    "4313": ["OBRAS"],
+    "4319": ["OBRAS"],
+    "4321": ["OBRAS"],
+    "4322": ["OBRAS"],
+    "4329": ["OBRAS"],
+    "4330": ["OBRAS"],
+    "4391": ["OBRAS"],
+    "4399": ["OBRAS"],
+    # Serviços
+    "8111": ["SERVICOS"],
+    "8112": ["SERVICOS"],
+    "8121": ["SERVICOS"],
+    "8122": ["SERVICOS"],
+    "8129": ["SERVICOS"],
+    "8011": ["SERVICOS"],
+    "8012": ["SERVICOS"],
+    "8020": ["SERVICOS"],
+    # TI
+    "6201": ["TECNOLOGIA_TI"],
+    "6202": ["TECNOLOGIA_TI"],
+    "6203": ["TECNOLOGIA_TI"],
+    "6204": ["TECNOLOGIA_TI"],
+    "6209": ["TECNOLOGIA_TI"],
+    "6311": ["TECNOLOGIA_TI"],
+    "6319": ["TECNOLOGIA_TI"],
+    "6399": ["TECNOLOGIA_TI"],
+    # Alimentação
+    "4711": ["ALIMENTACAO"],
+    "4712": ["ALIMENTACAO"],
+    "4721": ["ALIMENTACAO"],
+    "4722": ["ALIMENTACAO"],
+    "4723": ["ALIMENTACAO"],
+    "4724": ["ALIMENTACAO"],
+    "4729": ["ALIMENTACAO"],
+    # Educação
+    "8511": ["EDUCACAO"],
+    "8512": ["EDUCACAO"],
+    "8513": ["EDUCACAO"],
+    "8520": ["EDUCACAO"],
+    "8531": ["EDUCACAO"],
+    "8532": ["EDUCACAO"],
+    "8541": ["EDUCACAO"],
+    "8542": ["EDUCACAO"],
+    "8550": ["EDUCACAO"],
+    # Veículos
+    "4511": ["VEICULOS"],
+    "4512": ["VEICULOS"],
+    "4530": ["VEICULOS"],
+    "4541": ["VEICULOS"],
+    "4542": ["VEICULOS"],
+    "4543": ["VEICULOS"],
+    "7711": ["VEICULOS"],
+    "7719": ["VEICULOS"],
+    # Atacadistas genéricos — compatíveis com SAUDE, ALIMENTACAO, MOBILIARIO
+    "4647": ["SAUDE", "MOBILIARIO"],
+    "4649": ["SAUDE", "MOBILIARIO", "SERVICOS"],
+    "4789": ["SAUDE", "ALIMENTACAO", "MOBILIARIO", "EDUCACAO"],
+    "4744": ["OBRAS", "MOBILIARIO"],
+    "4742": ["OBRAS"],
+    "4743": ["OBRAS"],
+    # Comércio varejista genérico — amplo
+    "4754": ["MOBILIARIO"],
+    "4755": ["MOBILIARIO", "EDUCACAO"],
+    "4761": ["EDUCACAO"],
+    "4762": ["EDUCACAO"],
+    "4763": ["EDUCACAO", "SERVICOS"],
+    "4773": ["SAUDE"],
+    # Transporte
+    "4921": ["VEICULOS", "SERVICOS"],
+    "4922": ["VEICULOS", "SERVICOS"],
+    "4923": ["VEICULOS"],
+    "4929": ["VEICULOS", "SERVICOS"],
+    "4930": ["VEICULOS", "OBRAS"],
+    # Serviços de organização de eventos
+    "8230": ["SERVICOS", "EDUCACAO"],
+    # Outros serviços — amplo para evitar falso positivo
+    "9001": ["SERVICOS", "EDUCACAO"],
+    "9002": ["SERVICOS"],
+    "9003": ["SERVICOS"],
+    "9101": ["SERVICOS"],
+    "9102": ["SERVICOS"],
+    "9103": ["SERVICOS"],
+    "9200": ["SERVICOS"],
+    "9311": ["SERVICOS"],
+    "9312": ["SERVICOS"],
+    "9313": ["SERVICOS"],
+    "9319": ["SERVICOS"],
+    "9321": ["SERVICOS"],
+    "9329": ["SERVICOS"],
+    "9430": ["SERVICOS", "EDUCACAO"],
+    "9491": ["SERVICOS"],
+    "9492": ["SERVICOS"],
+    "9493": ["SERVICOS"],
+    "9499": ["SERVICOS"],
+    "9601": ["SERVICOS"],
+    "9602": ["SERVICOS"],
+    "9603": ["SERVICOS"],
+    "9609": ["SERVICOS"],
+}
 
-# ============================================================
-# DATACLASSES DE RESULTADO
-# ============================================================
 
 @dataclass
-class AnomaliaPreco:
-    valor_licitacao: float
-    valor_referencia: float
-    razao: float           # valor_licitacao / valor_referencia
-    percentil: float       # posição histórica
-    score: float
-    descricao: str
-
-
-@dataclass
-class AnomaliaRelacao:
-    tipo: str              # 'SOBRENOME', 'CPF_DIRETO', 'DOACAO'
+class RelacaoDetectada:
+    tipo: str
     nome_socio: str
     nome_politico: str
     cargo_politico: str
     uf_politico: str
     similaridade: float
     evidencia: str
-    score: float
-
-
-@dataclass
-class AnomaliaObjeto:
-    cnae_empresa: str
-    cnae_descricao: str
-    categoria_objeto: str
-    compativel: bool
-    score: float
-    descricao: str
 
 
 @dataclass
 class ResultadoAnalise:
-    licitacao_id: str
-    score_total: float
-    score_detalhes: dict
-    anomalias_preco: list[AnomaliaPreco] = field(default_factory=list)
-    anomalias_relacao: list[AnomaliaRelacao] = field(default_factory=list)
-    anomalias_objeto: list[AnomaliaObjeto] = field(default_factory=list)
+    score_total: int = 0
+    score_detalhes: dict = field(default_factory=dict)
     flags: dict = field(default_factory=dict)
+    anomalias_relacao: list = field(default_factory=list)
 
-
-# ============================================================
-# ENGINE
-# ============================================================
 
 class AnalysisEngine:
 
-    def normalizar_texto(self, texto: str) -> str:
+    def _normalizar_texto(self, texto: str) -> str:
         if not texto:
             return ""
-        nfkd = unicodedata.normalize("NFKD", texto.upper().strip())
+        nfkd = unicodedata.normalize("NFKD", texto.upper())
         return "".join(c for c in nfkd if not unicodedata.combining(c))
 
-    # ----------------------------------------------------------
-    # 1. ANÁLISE DE PREÇO
-    # ----------------------------------------------------------
+    def categorizar_objeto(self, descricao: str) -> str:
+        """
+        Classifica o objeto da licitação em uma categoria.
+        Usa matching de palavras-chave normalizadas.
+        Sem fallback para TECNOLOGIA_TI — usa LICITACAO_PUBLICA como genérico.
+        """
+        if not descricao:
+            return "LICITACAO_PUBLICA"
+
+        texto = self._normalizar_texto(descricao)
+
+        # Pontuação por categoria — ganha a que tiver mais matches
+        pontos: dict[str, int] = {cat: 0 for cat in CATEGORIAS}
+
+        for categoria, keywords in CATEGORIAS.items():
+            for kw in keywords:
+                kw_norm = self._normalizar_texto(kw)
+                if kw_norm and kw_norm in texto:
+                    # Palavras mais específicas (mais longas) valem mais
+                    pontos[categoria] += len(kw_norm.split())
+
+        melhor = max(pontos, key=lambda c: pontos[c])
+        if pontos[melhor] > 0:
+            return melhor
+
+        return "LICITACAO_PUBLICA"
+
+    def _cnae_compativel(self, cnae: str, categoria: str) -> bool:
+        """
+        Verifica se o CNAE da empresa é compatível com a categoria do objeto.
+        Retorna True se compatível ou se não há dados suficientes para decidir.
+        """
+        if not cnae or not categoria:
+            return True
+        if categoria == "LICITACAO_PUBLICA":
+            # Categoria genérica — nunca sinalizar incompatibilidade
+            return True
+
+        cnae_str = str(cnae).replace(".", "").replace("-", "").replace("/", "")
+        prefixo = cnae_str[:4]
+
+        cats_compativeis = CNAE_CATEGORIAS.get(prefixo)
+        if cats_compativeis is None:
+            # CNAE não mapeado — não sinalizar para evitar falso positivo
+            return True
+
+        return categoria in cats_compativeis
 
     def analisar_preco(
+        self, valor: float | None, historico: list[float]
+    ) -> tuple[int, str]:
+        """Retorna (score, descricao)."""
+        if not valor or valor <= 0 or len(historico) < 5:
+            return 0, ""
+        med = median(historico)
+        if med <= 0:
+            return 0, ""
+        ratio = valor / med
+        if ratio >= 3:
+            return SCORES["preco_acima_3x"], f"{ratio:.1f}x acima da mediana"
+        if ratio >= 2:
+            return SCORES["preco_acima_2x"], f"{ratio:.1f}x acima da mediana"
+        if ratio >= 1.5:
+            return SCORES["preco_acima_1_5x"], f"{ratio:.1f}x acima da mediana"
+        return 0, ""
+
+    def detectar_relacionamentos(
         self,
-        valor: float,
-        historico: list[float],
-        categoria: str = None,
-    ) -> Optional[AnomaliaPreco]:
+        socios: list[dict],
+        politicos: list[dict],
+        uf_licitacao: str,
+        doacoes: list[dict],
+        cnpj_empresa: str,
+    ) -> list[RelacaoDetectada]:
         """
-        Compara valor com histórico de licitações similares.
-        Se não há histórico, usa heurística por categoria.
+        Detecta vínculos entre sócios da empresa e políticos da UF.
+        Tipos: CPF_DIRETO (50pts), SOBRENOME (35pts), DOACAO (30pts).
         """
-        if not valor or valor <= 0:
-            return None
+        relacoes: list[RelacaoDetectada] = []
 
-        if len(historico) < 5:
-            return None  # amostra insuficiente
+        if not socios or not politicos:
+            return relacoes
 
-        import statistics
-        mediana = statistics.median(historico)
-        if mediana <= 0:
-            return None
+        # Filtra políticos da mesma UF
+        politicos_uf = [
+            p for p in politicos
+            if not uf_licitacao or p.get("uf", "").upper() == uf_licitacao.upper()
+        ]
 
-        razao = valor / mediana
-
-        # percentil simples
-        percentil = sum(1 for h in historico if h <= valor) / len(historico) * 100
-
-        score = 0
-        if razao >= 3:
-            score = SCORES["preco_acima_3x"]
-            descricao = f"Valor {razao:.1f}x acima da mediana histórica (R$ {mediana:,.2f})"
-        elif razao >= 2:
-            score = SCORES["preco_acima_2x"]
-            descricao = f"Valor {razao:.1f}x acima da mediana histórica (R$ {mediana:,.2f})"
-        elif razao >= 1.5:
-            score = SCORES["preco_acima_1_5x"]
-            descricao = f"Valor {razao:.1f}x acima da mediana histórica (R$ {mediana:,.2f})"
-        else:
-            return None
-
-        return AnomaliaPreco(
-            valor_licitacao=valor,
-            valor_referencia=mediana,
-            razao=razao,
-            percentil=percentil,
-            score=score,
-            descricao=descricao,
-        )
-
-    def analisar_preco_painel_precos(
-        self,
-        valor: float,
-        preco_referencia: dict,
-    ) -> Optional[AnomaliaPreco]:
-        """
-        Usa dados do Painel de Preços do governo federal como referência.
-        preco_referencia = {"mediana": X, "p75": Y, "p95": Z, "amostras": N}
-        """
-        if not valor or not preco_referencia:
-            return None
-
-        mediana = preco_referencia.get("preco_mediana", 0)
-        p95 = preco_referencia.get("preco_p95", 0)
-        if not mediana or mediana <= 0:
-            return None
-
-        razao = valor / mediana
-
-        score = 0
-        if razao >= 3:
-            score = SCORES["preco_acima_3x"]
-        elif razao >= 2:
-            score = SCORES["preco_acima_2x"]
-        elif razao >= 1.5:
-            score = SCORES["preco_acima_1_5x"]
-        else:
-            return None
-
-        return AnomaliaPreco(
-            valor_licitacao=valor,
-            valor_referencia=mediana,
-            razao=razao,
-            percentil=95 if valor > (p95 or mediana * 2) else 80,
-            score=score,
-            descricao=(
-                f"Preço {razao:.1f}x acima da mediana do Painel de Preços federal "
-                f"(ref: R$ {mediana:,.2f}, N={preco_referencia.get('total_amostras', '?')})"
-            ),
-        )
-
-    # ----------------------------------------------------------
-    # 2. ANÁLISE DE RELACIONAMENTO
-    # ----------------------------------------------------------
-
-    def _extrair_sobrenomes(self, nome: str) -> list[str]:
-        """Extrai sobrenomes relevantes (ignora preposições)."""
-        ignorar = {"DE", "DA", "DO", "DAS", "DOS", "E", "EM", "NA", "NO"}
-        partes = self.normalizar_texto(nome).split()
-        return [p for p in partes[1:] if p not in ignorar and len(p) > 2]
-
-    def _similaridade_nomes(self, nome1: str, nome2: str) -> float:
-        """
-        Calcula similaridade de sobrenomes.
-        Retorna 1.0 se compartilham sobrenome idêntico.
-        """
-        sobs1 = set(self._extrair_sobrenomes(nome1))
-        sobs2 = set(self._extrair_sobrenomes(nome2))
-
-        if not sobs1 or not sobs2:
-            return 0.0
-
-        intersecao = sobs1 & sobs2
-        if not intersecao:
-            return 0.0
-
-        # Jaccard
-        return len(intersecao) / len(sobs1 | sobs2)
-
-    def analisar_relacionamentos(
-        self,
-        socios: list[dict],          # [{nome_socio, cpf_cnpj_socio, cnpj}, ...]
-        politicos: list[dict],        # [{nome, cpf, cargo, uf, municipio}, ...]
-        doacoes: list[dict] = None,   # [{cpf_cnpj_doador, cnpj_empresa, ...}, ...]
-        uf_licitacao: str = None,
-        municipio_licitacao: str = None,
-    ) -> list[AnomaliaRelacao]:
-
-        anomalias = []
-        doacoes = doacoes or []
-
-        # índice de doadores por CNPJ
+        # Índice de doações por CNPJ
         cnpjs_doadores = {
-            d["cpf_cnpj_doador"]: d
-            for d in doacoes
-            if d.get("cpf_cnpj_doador")
+            d.get("cnpj_doador", ""): d for d in (doacoes or []) if d.get("cnpj_doador")
         }
 
         for socio in socios:
-            nome_socio = socio.get("nome_socio", "")
-            cpf_socio = "".join(filter(str.isdigit, socio.get("cpf_cnpj_socio", "") or ""))
-            cnpj_empresa = socio.get("cnpj", "")
+            cpf_socio = socio.get("cpf_cnpj_socio", "")
+            nome_socio_norm = socio.get("nome_normalizado") or self._normalizar_texto(
+                socio.get("nome_socio", "")
+            )
+            if not nome_socio_norm:
+                continue
 
-            for politico in politicos:
-                cpf_politico = politico.get("cpf", "")
-                nome_politico = politico.get("nome", "")
-                uf_pol = politico.get("uf", "")
-                municipio_pol = politico.get("municipio", "")
+            sobrenome_socio = nome_socio_norm.split()[-1] if nome_socio_norm else ""
+            # Filtra sobrenomes muito curtos ou comuns demais
+            if len(sobrenome_socio) < 4:
+                continue
 
-                # Filtro geográfico: só alerta se político é da mesma UF ou município
-                if uf_licitacao and uf_pol and uf_pol != uf_licitacao:
-                    continue
-
-                # --- MATCH CPF DIRETO ---
-                if cpf_socio and cpf_politico and cpf_socio == cpf_politico:
-                    anomalias.append(AnomaliaRelacao(
-                        tipo="CPF_DIRETO",
-                        nome_socio=nome_socio,
-                        nome_politico=nome_politico,
-                        cargo_politico=politico.get("cargo", ""),
-                        uf_politico=uf_pol,
-                        similaridade=1.0,
-                        evidencia=f"Sócio da empresa é o próprio político (CPF {cpf_politico[:3]}***{cpf_politico[-2:]})",
-                        score=SCORES["cpf_direto"],
-                    ))
-                    continue
-
-                # --- MATCH SOBRENOME ---
-                sim = self._similaridade_nomes(nome_socio, nome_politico)
-                if sim >= 0.4:
-                    tipo = "SOBRENOME_IDENTICO" if sim >= 0.7 else "SOBRENOME_SIMILAR"
-                    anomalias.append(AnomaliaRelacao(
-                        tipo=tipo,
-                        nome_socio=nome_socio,
-                        nome_politico=nome_politico,
-                        cargo_politico=politico.get("cargo", ""),
-                        uf_politico=uf_pol,
-                        similaridade=sim,
-                        evidencia=(
-                            f"Sócio '{nome_socio}' compartilha sobrenome com "
-                            f"{politico.get('cargo','')} '{nome_politico}' ({uf_pol})"
-                        ),
-                        score=SCORES["sobrenome_identico"] * sim,
-                    ))
-
-            # --- MATCH DOAÇÃO DE CAMPANHA ---
-            if cnpj_empresa in cnpjs_doadores:
-                doacao = cnpjs_doadores[cnpj_empresa]
-                politico_doado = next(
-                    (p for p in politicos if p.get("cpf") == doacao.get("cpf_candidato")),
-                    None,
+            for pol in politicos_uf:
+                nome_pol_norm = pol.get("nome_normalizado") or self._normalizar_texto(
+                    pol.get("nome", "")
                 )
-                if politico_doado:
-                    anomalias.append(AnomaliaRelacao(
-                        tipo="DOADOR_CAMPANHA",
+                if not nome_pol_norm:
+                    continue
+
+                # 1. CPF direto
+                cpf_pol = pol.get("cpf", "")
+                if cpf_socio and cpf_pol and cpf_socio == cpf_pol:
+                    relacoes.append(RelacaoDetectada(
+                        tipo="CPF_DIRETO",
                         nome_socio=socio.get("nome_socio", ""),
-                        nome_politico=politico_doado.get("nome", doacao.get("nome_candidato", "")),
-                        cargo_politico=politico_doado.get("cargo", ""),
-                        uf_politico=politico_doado.get("uf", ""),
+                        nome_politico=pol.get("nome", ""),
+                        cargo_politico=pol.get("cargo", ""),
+                        uf_politico=pol.get("uf", ""),
                         similaridade=1.0,
+                        evidencia=f"CPF {cpf_socio} coincide com político {pol.get('nome','')}",
+                    ))
+                    continue
+
+                # 2. Sobrenome coincide
+                sobrenome_pol = nome_pol_norm.split()[-1] if nome_pol_norm else ""
+                if (
+                    len(sobrenome_pol) >= 4
+                    and sobrenome_socio == sobrenome_pol
+                    # Evita sobrenomes ultra-comuns
+                    and sobrenome_socio not in {
+                        "SILVA", "SANTOS", "OLIVEIRA", "SOUZA", "LIMA",
+                        "PEREIRA", "FERREIRA", "COSTA", "RODRIGUES", "ALMEIDA",
+                        "NASCIMENTO", "LIMA", "ARAUJO", "FERNANDES", "CAVALCANTI",
+                        "BARBOSA", "RIBEIRO", "MARTINS", "CARVALHO", "MENDES",
+                    }
+                ):
+                    relacoes.append(RelacaoDetectada(
+                        tipo="SOBRENOME",
+                        nome_socio=socio.get("nome_socio", ""),
+                        nome_politico=pol.get("nome", ""),
+                        cargo_politico=pol.get("cargo", ""),
+                        uf_politico=pol.get("uf", ""),
+                        similaridade=0.8,
                         evidencia=(
-                            f"Empresa doou R$ {doacao.get('valor', 0):,.2f} para campanha de "
-                            f"'{doacao.get('nome_candidato')}' em {doacao.get('ano_eleicao')}"
+                            f"Sobrenome '{sobrenome_socio}' coincide entre "
+                            f"sócio e {pol.get('cargo','')} {pol.get('nome','')}"
                         ),
-                        score=SCORES["doador_campanha"],
                     ))
 
-        # remove duplicatas mantendo maior score
-        vistos = {}
-        for a in anomalias:
-            chave = (a.nome_politico, a.tipo)
-            if chave not in vistos or vistos[chave].score < a.score:
-                vistos[chave] = a
+        # 3. Doação de campanha
+        if cnpj_empresa and cnpj_empresa in cnpjs_doadores:
+            doacao = cnpjs_doadores[cnpj_empresa]
+            relacoes.append(RelacaoDetectada(
+                tipo="DOACAO_CAMPANHA",
+                nome_socio="",
+                nome_politico=doacao.get("nome_candidato", ""),
+                cargo_politico=doacao.get("cargo_candidato", ""),
+                uf_politico=doacao.get("uf", ""),
+                similaridade=0.9,
+                evidencia=(
+                    f"Empresa CNPJ {cnpj_empresa} doou R$ "
+                    f"{doacao.get('valor_doacao', 0):.0f} para campanha de "
+                    f"{doacao.get('nome_candidato', '')}"
+                ),
+            ))
 
-        return list(vistos.values())
-
-    # ----------------------------------------------------------
-    # 3. ANÁLISE DE OBJETO vs. CNAE
-    # ----------------------------------------------------------
-
-    def categorizar_objeto(self, descricao_objeto: str) -> str:
-        """Infere categoria do objeto pela descrição textual."""
-        descricao_norm = self.normalizar_texto(descricao_objeto)
-
-        melhor_cat = "OUTROS"
-        melhor_score = 0
-
-        for categoria, palavras in PALAVRAS_CATEGORIA.items():
-            hits = sum(
-                1 for p in palavras
-                if self.normalizar_texto(p) in descricao_norm
-            )
-            if hits > melhor_score:
-                melhor_score = hits
-                melhor_cat = categoria
-
-        return melhor_cat
-
-    def analisar_objeto_cnae(
-        self,
-        cnae_empresa: str,
-        cnae_descricao: str,
-        objeto_descricao: str,
-        categoria_objeto: str = None,
-    ) -> AnomaliaObjeto:
-        """Verifica se o CNAE da empresa é compatível com o objeto licitado."""
-        if not categoria_objeto:
-            categoria_objeto = self.categorizar_objeto(objeto_descricao)
-
-        cnaes_validos = CNAE_POR_CATEGORIA.get(categoria_objeto, [])
-
-        compativel = True
-        score = 0
-
-        if cnaes_validos and cnae_empresa:
-            cnae_norm = cnae_empresa.replace(".", "").replace("-", "")[:4]
-            compativel = any(
-                cnae_norm.startswith(c.replace(".", "").replace("-", ""))
-                for c in cnaes_validos
-            )
-            if not compativel:
-                score = SCORES["cnae_divergente"]
-
-        descricao = (
-            f"CNAE {cnae_empresa} ({cnae_descricao}) não é compatível "
-            f"com objeto da categoria '{categoria_objeto}'"
-            if not compativel else "CNAE compatível com objeto"
-        )
-
-        return AnomaliaObjeto(
-            cnae_empresa=cnae_empresa or "",
-            cnae_descricao=cnae_descricao or "",
-            categoria_objeto=categoria_objeto,
-            compativel=compativel,
-            score=score,
-            descricao=descricao,
-        )
-
-    # ----------------------------------------------------------
-    # 4. ANÁLISE DE PRAZO
-    # ----------------------------------------------------------
-
-    def analisar_prazo(self, data_publicacao, data_abertura) -> float:
-        """Edital com prazo muito curto pode ser direcionado."""
-        from datetime import datetime, date
-
-        if not data_publicacao or not data_abertura:
-            return 0.0
-
-        def to_date(d):
-            if isinstance(d, date):
-                return d
-            for fmt in ["%Y-%m-%d", "%d/%m/%Y"]:
-                try:
-                    return datetime.strptime(d, fmt).date()
-                except (ValueError, TypeError):
-                    pass
-            return None
-
-        pub = to_date(data_publicacao)
-        abert = to_date(data_abertura)
-
-        if not pub or not abert:
-            return 0.0
-
-        dias = (abert - pub).days
-        if dias < 3:
-            return SCORES["prazo_edital_curto"]
-        return 0.0
-
-    # ----------------------------------------------------------
-    # 5. ANÁLISE CONSOLIDADA
-    # ----------------------------------------------------------
+        return relacoes
 
     def analisar_licitacao(
         self,
         licitacao: dict,
-        participantes: list[dict],       # vencedor incluso
-        empresas: dict[str, dict],       # cnpj → dados empresa
-        socios_por_cnpj: dict[str, list],  # cnpj → lista sócios
+        participantes: list[dict],
+        empresas: dict,
+        socios_por_cnpj: dict,
         politicos: list[dict],
-        historico_precos: list[float] = None,
-        preco_referencia: dict = None,
-        doacoes: list[dict] = None,
-        sancoes_por_cnpj: dict[str, dict] = None,
+        historico_precos: list[float],
+        doacoes: list[dict],
+        sancoes_por_cnpj: dict,
     ) -> ResultadoAnalise:
 
-        licitacao_id = licitacao.get("id", "")
-        valor = licitacao.get("valor_homologado") or licitacao.get("valor_estimado") or 0
-        score_total = 0
-        score_detalhes = {}
-        todas_relacoes = []
-        todas_anomalias_objeto = []
+        resultado = ResultadoAnalise()
+        score = 0
+        detalhes: dict = {}
+        flags: dict = {}
+        anomalias: list[RelacaoDetectada] = []
 
-        # --- PREÇO ---
-        anomalia_preco = None
-        if preco_referencia:
-            anomalia_preco = self.analisar_preco_painel_precos(valor, preco_referencia)
-        elif historico_precos:
-            anomalia_preco = self.analisar_preco(valor, historico_precos)
+        # Categoria do objeto — sempre salva
+        categoria = self.categorizar_objeto(licitacao.get("objeto_descricao", ""))
+        detalhes["categoria_objeto"] = categoria
 
-        if anomalia_preco:
-            score_total += anomalia_preco.score
-            score_detalhes["preco"] = {
-                "score": anomalia_preco.score,
-                "descricao": anomalia_preco.descricao,
-                "razao": anomalia_preco.razao,
-            }
+        valor = licitacao.get("valor_homologado") or licitacao.get("valor_estimado")
+        uf = licitacao.get("orgao_uf", "")
 
-        # --- PARTICIPANTE ÚNICO ---
-        num_participantes = licitacao.get("numero_participantes") or len(participantes)
-        score_participante = 0
-        if num_participantes == 1:
-            score_participante = SCORES["participante_unico"]
-            score_total += score_participante
-            score_detalhes["participante_unico"] = {
-                "score": score_participante,
-                "descricao": "Apenas 1 participante na licitação",
-            }
+        # ── Preço anômalo ─────────────────────────────────────
+        score_preco, desc_preco = self.analisar_preco(valor, historico_precos)
+        if score_preco > 0:
+            score += score_preco
+            detalhes["preco_anomalo"] = desc_preco
+            flags["flag_preco_anomalo"] = True
+        else:
+            flags["flag_preco_anomalo"] = False
 
-        # --- PRAZO ---
-        score_prazo = self.analisar_prazo(
-            licitacao.get("data_publicacao") or licitacao.get("data_abertura"),
-            licitacao.get("data_abertura"),
-        )
-        if score_prazo:
-            score_total += score_prazo
-            score_detalhes["prazo"] = {
-                "score": score_prazo,
-                "descricao": "Prazo entre publicação e abertura menor que 3 dias",
-            }
+        # ── Análise por empresa ────────────────────────────────
+        flag_objeto_inadequado = False
+        flag_sancionada = False
+        flag_relacionamento = False
 
-        # --- POR CADA VENCEDOR / PARTICIPANTE ---
-        categoria_objeto = self.categorizar_objeto(licitacao.get("objeto_descricao", ""))
-
-        for participante in participantes:
-            cnpj = participante.get("cnpj", "")
+        for p in participantes:
+            cnpj = p.get("cnpj", "")
             if not cnpj:
                 continue
 
             empresa = empresas.get(cnpj, {})
             socios = socios_por_cnpj.get(cnpj, [])
-            sancao = (sancoes_por_cnpj or {}).get(cnpj, {})
+            sancao = sancoes_por_cnpj.get(cnpj)
 
-            # --- EMPRESA FANTASMA ---
-            from collectors.cnpj import CNPJCollector
-            col = CNPJCollector()
-            if col.detectar_empresa_fantasma(empresa):
-                score_total += SCORES["empresa_aberta_recente"]
-                score_detalhes.setdefault("empresa_suspeita", {
-                    "score": SCORES["empresa_aberta_recente"],
-                    "cnpj": cnpj,
-                    "descricao": "Empresa aberta recentemente com capital social baixo",
-                })
-
-            # --- SANÇÃO ---
-            if sancao.get("sanctionado"):
-                score_total += SCORES["empresa_sanctionada"]
-                score_detalhes.setdefault("sancao", {
-                    "score": SCORES["empresa_sanctionada"],
-                    "cnpj": cnpj,
-                    "descricao": f"Empresa presente em lista de sanções (CEIS/CNEP)",
-                })
-
-            # --- CNAE vs. OBJETO ---
-            if participante.get("vencedor") and empresa:
-                anomalia_obj = self.analisar_objeto_cnae(
-                    cnae_empresa=empresa.get("cnae_principal", ""),
-                    cnae_descricao=empresa.get("cnae_descricao", ""),
-                    objeto_descricao=licitacao.get("objeto_descricao", ""),
-                    categoria_objeto=categoria_objeto,
+            # CNAE incompatível com objeto
+            cnae = empresa.get("cnae_principal", "")
+            cnae_desc = empresa.get("cnae_descricao", "")
+            if cnae and not self._cnae_compativel(cnae, categoria):
+                score += SCORES["cnae_incompativel"]
+                detalhes["cnae_divergente"] = (
+                    f"CNAE {cnae} ({cnae_desc}) não é compatível com "
+                    f"objeto da categoria '{categoria}'"
                 )
-                todas_anomalias_objeto.append(anomalia_obj)
-                if not anomalia_obj.compativel:
-                    score_total += anomalia_obj.score
-                    score_detalhes["cnae_divergente"] = {
-                        "score": anomalia_obj.score,
-                        "descricao": anomalia_obj.descricao,
-                    }
+                flag_objeto_inadequado = True
 
-            # --- RELACIONAMENTO ---
-            if socios:
-                relacoes = self.analisar_relacionamentos(
-                    socios=socios,
-                    politicos=politicos,
-                    doacoes=doacoes or [],
-                    uf_licitacao=licitacao.get("orgao_uf"),
+            # Empresa sancionada (CGU)
+            if sancao and sancao.get("sancionada"):
+                score += SCORES["empresa_sancionada"]
+                detalhes["empresa_sancionada"] = (
+                    f"Empresa {cnpj} consta em {sancao.get('lista', 'lista CGU')}"
                 )
-                todas_relacoes.extend(relacoes)
+                flag_sancionada = True
 
-                if relacoes:
-                    score_relacao = min(sum(r.score for r in relacoes), 50)
-                    score_total += score_relacao
-                    score_detalhes["relacionamento"] = {
-                        "score": score_relacao,
-                        "total_relacoes": len(relacoes),
-                        "descricao": f"{len(relacoes)} vínculo(s) detectado(s) com políticos",
-                    }
+            # Relacionamentos políticos
+            rels = self.detectar_relacionamentos(
+                socios=socios,
+                politicos=politicos,
+                uf_licitacao=uf,
+                doacoes=doacoes,
+                cnpj_empresa=cnpj,
+            )
+            for rel in rels:
+                if rel.tipo == "CPF_DIRETO":
+                    score += SCORES["cpf_direto"]
+                elif rel.tipo == "SOBRENOME":
+                    score += SCORES["sobrenome_coincide"]
+                elif rel.tipo == "DOACAO_CAMPANHA":
+                    score += SCORES["doacao_campanha"]
+                anomalias.append(rel)
+                flag_relacionamento = True
 
-        # normaliza score em 0-100
-        score_total = min(round(score_total, 2), 100.0)
+        flags["flag_objeto_inadequado"] = flag_objeto_inadequado
+        flags["flag_relacionamento"] = flag_relacionamento
+        flags["flag_empresa_sancionada"] = flag_sancionada
+        # flag_participante_unico removido — não temos dados confiáveis
+        flags["flag_participante_unico"] = False
+        # flag_prazo_suspeito desabilitado — PNCP não fornece data_publicacao
+        flags["flag_prazo_suspeito"] = False
 
-        return ResultadoAnalise(
-            licitacao_id=licitacao_id,
-            score_total=score_total,
-            score_detalhes=score_detalhes,
-            anomalias_preco=[anomalia_preco] if anomalia_preco else [],
-            anomalias_relacao=todas_relacoes,
-            anomalias_objeto=todas_anomalias_objeto,
-            flags={
-                "flag_preco_anomalo": anomalia_preco is not None,
-                "flag_relacionamento": len(todas_relacoes) > 0,
-                "flag_objeto_inadequado": any(not a.compativel for a in todas_anomalias_objeto),
-                "flag_participante_unico": num_participantes == 1,
-                "flag_prazo_suspeito": score_prazo > 0,
-            },
-        )
+        resultado.score_total = min(score, 100)
+        resultado.score_detalhes = detalhes
+        resultado.flags = flags
+        resultado.anomalias_relacao = anomalias
+
+        return resultado
