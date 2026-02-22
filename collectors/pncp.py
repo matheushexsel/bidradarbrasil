@@ -243,9 +243,19 @@ class PNCPCollector:
             "orgao_codigo_ibge": str(codigo_ibge) if codigo_ibge else "",
             "modalidade": MODALIDADES_MAP.get(
                 raw.get("modalidadeId"),
-                raw.get("modalidadeNome", ""),
+                (
+                    raw.get("modalidadeNome", {}).get("nome", "")
+                    if isinstance(raw.get("modalidadeNome"), dict)
+                    else str(raw.get("modalidadeNome") or "")
+                ),
             ),
-            "tipo_objeto": raw.get("tipoContrato", raw.get("tipoInstrumentoConvocatorioNome", "")),
+            # tipoContrato no /contratos pode ser dict {"id": X, "nome": "..."}
+            # tipoInstrumentoConvocatorioNome no /publicacao já é string
+            "tipo_objeto": (
+                raw.get("tipoContrato", {}).get("nome", "")
+                if isinstance(raw.get("tipoContrato"), dict)
+                else str(raw.get("tipoContrato") or raw.get("tipoInstrumentoConvocatorioNome") or "")
+            ),
             "objeto_descricao": (
                 raw.get("objetoContrato")
                 or raw.get("objetoCompra")
@@ -256,13 +266,16 @@ class PNCPCollector:
                 raw.get("valorGlobal")
                 or raw.get("valorInicial")
             ),
-            "data_abertura": (raw.get("dataPublicacaoPncp") or "")[:10] or None,
+            "data_abertura": (str(raw.get("dataPublicacaoPncp") or ""))[:10] or None,
             "data_homologacao": (
-                raw.get("dataAssinatura")
-                or raw.get("dataPublicacaoPncp")
-                or ""
+                str(raw.get("dataAssinatura") or raw.get("dataPublicacaoPncp") or "")
             )[:10] or None,
-            "situacao": raw.get("situacaoContrato", raw.get("situacaoCompraNome", "")),
+            # situacaoContrato no /contratos pode ser dict {"id": X, "nome": "..."}
+            "situacao": (
+                raw.get("situacaoContrato", {}).get("nome", "")
+                if isinstance(raw.get("situacaoContrato"), dict)
+                else str(raw.get("situacaoContrato") or raw.get("situacaoCompraNome") or "")
+            ),
             # Dados do vencedor — usados no pipeline para buscar empresa
             "cnpj_fornecedor": "".join(filter(str.isdigit, cnpj_fornecedor)),
             "nome_fornecedor": nome_fornecedor,
@@ -321,7 +334,11 @@ class PNCPCollector:
             "orgao_codigo_ibge": str(codigo_ibge) if codigo_ibge else "",
             "modalidade": MODALIDADES_MAP.get(
                 raw.get("modalidadeId"),
-                raw.get("modalidadeNome", ""),
+                (
+                    raw.get("modalidadeNome", {}).get("nome", "")
+                    if isinstance(raw.get("modalidadeNome"), dict)
+                    else str(raw.get("modalidadeNome") or "")
+                ),
             ),
             "tipo_objeto": raw.get("tipoInstrumentoConvocatorioNome", ""),
             "objeto_descricao": raw.get("objetoCompra", ""),
