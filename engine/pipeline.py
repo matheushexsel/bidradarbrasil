@@ -187,20 +187,28 @@ class Pipeline:
                     s["qualificacao"]    = (s.get("qualificacao") or "")[:100]
                     s["cpf_cnpj_socio"]  = (s.get("cpf_cnpj_socio") or "")[:18]
                     # WHERE NOT EXISTS: evita duplicata sem depender de constraint
+                    s_params = {
+                        "s_cnpj":        s.get("cnpj", ""),
+                        "cpf_cnpj_socio": s.get("cpf_cnpj_socio", ""),
+                        "nome_socio":    s.get("nome_socio", ""),
+                        "s_nome_norm":   s.get("nome_normalizado", ""),
+                        "qualificacao":  s.get("qualificacao", ""),
+                        "data_entrada":  s.get("data_entrada"),
+                    }
                     await self.db.execute(
                         text("""
                             INSERT INTO socios
                                 (cnpj, cpf_cnpj_socio, nome_socio, nome_normalizado,
                                  qualificacao, data_entrada)
-                            SELECT :cnpj, :cpf_cnpj_socio, :nome_socio, :nome_normalizado,
+                            SELECT :s_cnpj, :cpf_cnpj_socio, :nome_socio, :s_nome_norm,
                                    :qualificacao, :data_entrada
                             WHERE NOT EXISTS (
                                 SELECT 1 FROM socios
-                                WHERE cnpj = :cnpj
-                                  AND nome_normalizado = :nome_normalizado
+                                WHERE cnpj = :s_cnpj
+                                  AND nome_normalizado = :s_nome_norm
                             )
                         """),
-                        s,
+                        s_params,
                     )
                 await self.db.execute(text("RELEASE SAVEPOINT sp_socios"))
             except Exception as e:
@@ -252,15 +260,15 @@ class Pipeline:
             text("""
                 INSERT INTO licitacao_participantes
                     (licitacao_id, cnpj, razao_social, vencedor, valor_proposta)
-                SELECT :licitacao_id, :cnpj, :razao_social, :vencedor, :valor_proposta
+                SELECT :p_lid, :p_cnpj, :razao_social, :vencedor, :valor_proposta
                 WHERE NOT EXISTS (
                     SELECT 1 FROM licitacao_participantes
-                    WHERE licitacao_id = :licitacao_id AND cnpj = :cnpj
+                    WHERE licitacao_id = :p_lid AND cnpj = :p_cnpj
                 )
             """),
             {
-                "licitacao_id":   licitacao_id,
-                "cnpj":           (p.get("cnpj") or "")[:18],
+                "p_lid":          licitacao_id,
+                "p_cnpj":         (p.get("cnpj") or "")[:18],
                 "razao_social":   (p.get("razao_social") or "")[:255],
                 "vencedor":       bool(p.get("vencedor", False)),
                 "valor_proposta": p.get("valor_proposta"),
@@ -304,21 +312,21 @@ class Pipeline:
                         cargo_politico, uf_politico, tipo_vinculo, similaridade, evidencia
                     )
                     SELECT
-                        :licitacao_id, :tipo_relacao, :nome_socio, :nome_politico,
+                        :r_lid, :r_tipo, :r_socio, :r_politico,
                         :cargo_politico, :uf_politico, :tipo_vinculo, :similaridade, :evidencia
                     WHERE NOT EXISTS (
                         SELECT 1 FROM relacoes_detectadas
-                        WHERE licitacao_id = :licitacao_id
-                          AND tipo_relacao  = :tipo_relacao
-                          AND nome_socio    = :nome_socio
-                          AND nome_politico = :nome_politico
+                        WHERE licitacao_id = :r_lid
+                          AND tipo_relacao  = :r_tipo
+                          AND nome_socio    = :r_socio
+                          AND nome_politico = :r_politico
                     )
                 """),
                 {
-                    "licitacao_id":   licitacao_id,
-                    "tipo_relacao":   (relacao.tipo or "")[:50],
-                    "nome_socio":     (relacao.nome_socio or "")[:255],
-                    "nome_politico":  (relacao.nome_politico or "")[:255],
+                    "r_lid":          licitacao_id,
+                    "r_tipo":         (relacao.tipo or "")[:50],
+                    "r_socio":        (relacao.nome_socio or "")[:255],
+                    "r_politico":     (relacao.nome_politico or "")[:255],
                     "cargo_politico": (relacao.cargo_politico or "")[:100],
                     "uf_politico":    (relacao.uf_politico or "")[:2],
                     "tipo_vinculo":   (relacao.tipo or "")[:50],
