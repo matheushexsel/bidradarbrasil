@@ -1,3 +1,4 @@
+# collectors/tse.py
 """
 Coletor TSE - Candidaturas, Bens e Doações de Campanha
 Dados: https://dadosabertos.tse.jus.br/
@@ -92,10 +93,13 @@ class TSECollector:
             r = await self.client.get(url)
 
             if r.status_code == 404:
+                logger.info(f"TSE 404: {url} - Nenhum dado disponível")
                 return []
+
             r.raise_for_status()
 
             content = r.content
+            logger.info(f"TSE download OK: {len(content)} bytes | status={r.status_code}")
 
             # Extrai CSV do ZIP
             if url.endswith(".zip") or content[:2] == b"PK":
@@ -143,13 +147,16 @@ class TSECollector:
                 logger.warning(f"Erro ao parsear CSV {url}: {e}")
                 return []
 
+            # Log sempre, mesmo se 0 linhas
             if rows:
                 # Normaliza chaves: remove espaços e BOM residual
                 rows = [
                     {k.strip().lstrip("\ufeff"): v for k, v in row.items()}
                     for row in rows
                 ]
-                logger.debug(f"TSE CSV {url}: {len(rows)} linhas | colunas: {list(rows[0].keys())[:5]}")
+                logger.info(f"TSE CSV {url}: {len(rows)} linhas | colunas: {list(rows[0].keys())[:5]}")
+            else:
+                logger.info(f"TSE CSV {url}: 0 linhas")
 
             return rows
 
