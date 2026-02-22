@@ -1,7 +1,8 @@
 """
 Coletor TSE - Candidaturas, Bens e Doações de Campanha
 Dados: https://dadosabertos.tse.jus.br/
-Arquivos CSV por estado/ano, separador ; e encoding latin-1.
+
+FIX: downloads sequenciais por ano para evitar throttling do CDN.
 """
 
 import asyncio
@@ -14,33 +15,29 @@ from loguru import logger
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 BASE_URL = "https://cdn.tse.jus.br/estatistica/sead/odsele"
-
 ANOS_ELEICAO = [2024, 2022, 2020, 2018, 2016]
 
-# Mapeamento flexível de nomes de colunas do TSE
-# O TSE às vezes muda nomes entre anos/versões
-COL_CPF_CAND = ["CPF_CANDIDATO", "NR_CPF_CANDIDATO", "CPF"]
+COL_CPF_CAND  = ["CPF_CANDIDATO", "NR_CPF_CANDIDATO", "CPF"]
 COL_NOME_CAND = ["NM_CANDIDATO", "NOME_CANDIDATO", "NM_CAND"]
 COL_NOME_URNA = ["NM_URNA_CANDIDATO", "NM_URNA", "NOME_URNA"]
-COL_PARTIDO = ["SG_PARTIDO", "PARTIDO", "SG_LEGENDA"]
-COL_CARGO = ["DS_CARGO", "DESCRICAO_CARGO", "NM_CARGO"]
-COL_UF = ["SG_UF", "UF", "SG_UF_NASCIMENTO"]
+COL_PARTIDO   = ["SG_PARTIDO", "PARTIDO", "SG_LEGENDA"]
+COL_CARGO     = ["DS_CARGO", "DESCRICAO_CARGO", "NM_CARGO"]
+COL_UF        = ["SG_UF", "UF", "SG_UF_NASCIMENTO"]
 COL_MUNICIPIO = ["NM_MUNICIPIO", "MUNICIPIO", "NM_UE"]
-COL_IBGE = ["CD_MUNICIPIO", "CODIGO_MUNICIPIO", "SQ_CANDIDATO"]
-COL_SITUACAO = ["DS_SIT_TOT_TURNO", "SITUACAO_TURNO", "DS_SITUACAO_CANDIDATURA"]
-COL_CPF_BEM = ["CPF_CANDIDATO", "NR_CPF_CANDIDATO"]
-COL_TIPO_BEM = ["DS_TIPO_BEM_CANDIDATO", "TIPO_BEM", "DS_TIPO_BEM"]
-COL_DESC_BEM = ["DS_BEM_CANDIDATO", "DESCRICAO_BEM", "DS_BEM"]
-COL_VR_BEM = ["VR_BEM_CANDIDATO", "VALOR_BEM", "VR_BEM"]
-COL_CPF_DOADOR = ["CPF_CNPJ_DOADOR", "NR_CPF_CNPJ_DOADOR", "CNPJ_CPF_DOADOR"]
+COL_IBGE      = ["CD_MUNICIPIO", "CODIGO_MUNICIPIO", "SQ_CANDIDATO"]
+COL_SITUACAO  = ["DS_SIT_TOT_TURNO", "SITUACAO_TURNO", "DS_SITUACAO_CANDIDATURA"]
+COL_CPF_BEM   = ["CPF_CANDIDATO", "NR_CPF_CANDIDATO"]
+COL_TIPO_BEM  = ["DS_TIPO_BEM_CANDIDATO", "TIPO_BEM", "DS_TIPO_BEM"]
+COL_DESC_BEM  = ["DS_BEM_CANDIDATO", "DESCRICAO_BEM", "DS_BEM"]
+COL_VR_BEM    = ["VR_BEM_CANDIDATO", "VALOR_BEM", "VR_BEM"]
+COL_CPF_DOADOR  = ["CPF_CNPJ_DOADOR", "NR_CPF_CNPJ_DOADOR", "CNPJ_CPF_DOADOR"]
 COL_NOME_DOADOR = ["NM_DOADOR", "NOME_DOADOR"]
-COL_VR_RECEITA = ["VR_RECEITA", "VALOR_RECEITA", "VR_RECEITA_ATUALIZADO"]
-COL_DT_RECEITA = ["DT_RECEITA", "DATA_RECEITA"]
-COL_ORIGEM = ["DS_ORIGEM_RECEITA", "ORIGEM_RECEITA", "DS_ESPECIE_RECEITA"]
+COL_VR_RECEITA  = ["VR_RECEITA", "VALOR_RECEITA", "VR_RECEITA_ATUALIZADO"]
+COL_DT_RECEITA  = ["DT_RECEITA", "DATA_RECEITA"]
+COL_ORIGEM      = ["DS_ORIGEM_RECEITA", "ORIGEM_RECEITA", "DS_ESPECIE_RECEITA"]
 
 
-def _get_col(row: dict, cols: list[str], default: str = "") -> str:
-    """Busca um valor no dict usando lista de nomes alternativos de colunas."""
+def _get_col(row: dict, cols: list, default: str = "") -> str:
     for col in cols:
         if col in row and row[col] is not None:
             val = str(row[col]).strip()
@@ -84,55 +81,69 @@ class TSECollector:
         except (ValueError, AttributeError):
             return 0.0
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=2, max=15))
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=3, max=20))
     async def _download_csv(self, url: str) -> list[dict]:
-        """Download e parse de CSV zippado do TSE."""
         try:
-            logger.debug(f"Baixando: {url}")
+            logger.debug(f"TSE baixando: {url}")
             r = await self.client.get(url)
 
             if r.status_code == 404:
-                logger.info(f"TSE 404: {url} - Nenhum dado disponível")
+                logger.debug(f"TSE 404 (não existe): {url}")
                 return []
 
             r.raise_for_status()
-
             content = r.content
-            logger.info(f"TSE download OK: {len(content)} bytes | status={r.status_code}")
+            logger.debug(f"TSE download: {len(content)} bytes | {url}")
 
-            # Extrai CSV do ZIP
-            if url.endswith(".zip") or content[:2] == b"PK":
+            if len(content) < 100:
+                logger.warning(f"TSE arquivo muito pequeno ({len(content)} bytes): {url}")
+                return []
+
+            # Descompacta ZIP
+            if content[:2] == b"PK":
                 try:
                     with zipfile.ZipFile(io.BytesIO(content)) as z:
                         csv_files = [f for f in z.namelist() if f.lower().endswith(".csv")]
                         if not csv_files:
-                            logger.warning(f"ZIP sem CSV: {url} | arquivos: {z.namelist()}")
+                            logger.warning(f"TSE ZIP sem CSV: {url} | conteúdo: {z.namelist()}")
                             return []
-                        # Pega o maior CSV (o principal, ignorando índices)
-                        csv_file = sorted(csv_files, key=lambda f: z.getinfo(f).file_size, reverse=True)[0]
+                        # Maior CSV = arquivo principal
+                        csv_file = sorted(
+                            csv_files,
+                            key=lambda f: z.getinfo(f).file_size,
+                            reverse=True
+                        )[0]
+                        logger.debug(f"TSE extraindo {csv_file} ({z.getinfo(csv_file).file_size} bytes)")
                         with z.open(csv_file) as f:
                             content = f.read()
                 except zipfile.BadZipFile:
-                    logger.warning(f"ZIP corrompido: {url}")
+                    logger.warning(f"TSE ZIP corrompido: {url}")
                     return []
+            else:
+                logger.warning(f"TSE resposta não é ZIP: {url} | magic={content[:4]}")
+                return []
 
-            # Tenta decodificar — TSE usa latin-1 historicamente
+            # Decodifica
             text = None
-            for encoding in ["latin-1", "cp1252", "utf-8-sig", "utf-8"]:
+            for enc in ["latin-1", "cp1252", "utf-8-sig", "utf-8"]:
                 try:
-                    text = content.decode(encoding)
+                    text = content.decode(enc)
                     break
                 except (UnicodeDecodeError, LookupError):
                     continue
 
-            if text is None:
-                logger.warning(f"Não foi possível decodificar: {url}")
+            if not text:
+                logger.warning(f"TSE falha ao decodificar: {url}")
                 return []
 
-            # Remove BOM se presente (corrompe o nome da primeira coluna)
-            text = text.lstrip("\ufeff").lstrip("\ufeff")
+            # Remove BOM
+            text = text.lstrip("\ufeff")
 
-            # Lê o CSV
+            linhas = text.strip().splitlines()
+            if len(linhas) < 2:
+                logger.warning(f"TSE CSV vazio (só header ou vazio): {url}")
+                return []
+
             reader = csv.DictReader(
                 io.StringIO(text),
                 delimiter=";",
@@ -140,22 +151,15 @@ class TSECollector:
                 skipinitialspace=True,
             )
 
-            try:
-                rows = list(reader)
-            except Exception as e:
-                logger.warning(f"Erro ao parsear CSV {url}: {e}")
-                return []
+            rows = list(reader)
 
-            # Log sempre, mesmo se 0 linhas
+            # Normaliza chaves
+            rows = [{k.strip().lstrip("\ufeff"): v for k, v in row.items()} for row in rows]
+
             if rows:
-                # Normaliza chaves: remove espaços e BOM residual
-                rows = [
-                    {k.strip().lstrip("\ufeff"): v for k, v in row.items()}
-                    for row in rows
-                ]
-                logger.info(f"TSE CSV {url}: {len(rows)} linhas | colunas: {list(rows[0].keys())[:5]}")
+                logger.info(f"TSE {url}: {len(rows)} linhas | cols={list(rows[0].keys())[:5]}")
             else:
-                logger.info(f"TSE CSV {url}: 0 linhas")
+                logger.warning(f"TSE CSV parseou 0 linhas: {url}")
 
             return rows
 
@@ -168,7 +172,7 @@ class TSECollector:
             logger.error(f"TSE erro {url}: {type(e).__name__}: {e}")
             raise
 
-    async def coletar_candidatos(self, uf: str, ano: int = 2024) -> list[dict]:
+    async def coletar_candidatos(self, uf: str, ano: int) -> list[dict]:
         url = f"{BASE_URL}/consulta_cand/consulta_cand_{ano}_{uf.upper()}.zip"
         rows = await self._download_csv(url)
 
@@ -176,7 +180,6 @@ class TSECollector:
         for row in rows:
             cpf = self._limpar_cpf(_get_col(row, COL_CPF_CAND))
             nome = _get_col(row, COL_NOME_CAND)
-
             if not cpf or not nome:
                 continue
 
@@ -201,10 +204,10 @@ class TSECollector:
                 "ano_eleicao": ano,
             })
 
-        logger.info(f"TSE candidatos {uf}/{ano}: {len(politicos)} registros")
+        logger.info(f"TSE candidatos {uf}/{ano}: {len(politicos)}")
         return politicos
 
-    async def coletar_bens(self, uf: str, ano: int = 2024) -> list[dict]:
+    async def coletar_bens(self, uf: str, ano: int) -> list[dict]:
         url = f"{BASE_URL}/bem_candidato/bem_candidato_{ano}_{uf.upper()}.zip"
         rows = await self._download_csv(url)
 
@@ -213,7 +216,6 @@ class TSECollector:
             cpf = self._limpar_cpf(_get_col(row, COL_CPF_BEM))
             if not cpf:
                 continue
-
             bens.append({
                 "cpf": cpf,
                 "tipo_bem": _get_col(row, COL_TIPO_BEM),
@@ -222,10 +224,10 @@ class TSECollector:
                 "ano_eleicao": ano,
             })
 
-        logger.info(f"TSE bens {uf}/{ano}: {len(bens)} registros")
+        logger.info(f"TSE bens {uf}/{ano}: {len(bens)}")
         return bens
 
-    async def coletar_doacoes(self, uf: str, ano: int = 2024) -> list[dict]:
+    async def coletar_doacoes(self, uf: str, ano: int) -> list[dict]:
         url = f"{BASE_URL}/prestacao_contas/receitas_candidatos_{ano}_{uf.upper()}.zip"
         rows = await self._download_csv(url)
 
@@ -234,7 +236,6 @@ class TSECollector:
             cpf_cand = self._limpar_cpf(_get_col(row, COL_CPF_CAND))
             if not cpf_cand:
                 continue
-
             doacoes.append({
                 "cpf_cnpj_doador": self._limpar_cpf(_get_col(row, COL_CPF_DOADOR)),
                 "nome_doador": _get_col(row, COL_NOME_DOADOR),
@@ -249,7 +250,7 @@ class TSECollector:
                 "tipo_receita": _get_col(row, COL_ORIGEM),
             })
 
-        logger.info(f"TSE doações {uf}/{ano}: {len(doacoes)} registros")
+        logger.info(f"TSE doações {uf}/{ano}: {len(doacoes)}")
         return doacoes
 
     async def coletar_uf_completo(self, uf: str, anos: list[int] = None) -> dict:
@@ -260,21 +261,32 @@ class TSECollector:
         todos_bens = []
         todas_doacoes = []
 
+        # *** FIX THROTTLING ***
+        # Downloads sequenciais por ano com pausa entre eles.
+        # 27 estados em paralelo × downloads simultâneos = CDN bloqueia.
+        # Sequencial por ano garante que o CDN não throttle.
         for ano in anos:
             try:
-                politicos = await self.coletar_candidatos(uf, ano)
-                todos_politicos.extend(politicos)
+                # Os 3 downloads do mesmo ano podem ser paralelos (mesmos arquivos)
+                candidatos, bens, doacoes = await asyncio.gather(
+                    self.coletar_candidatos(uf, ano),
+                    self.coletar_bens(uf, ano),
+                    self.coletar_doacoes(uf, ano),
+                    return_exceptions=True,
+                )
 
-                bens = await self.coletar_bens(uf, ano)
-                todos_bens.extend(bens)
+                if not isinstance(candidatos, Exception):
+                    todos_politicos.extend(candidatos)
+                if not isinstance(bens, Exception):
+                    todos_bens.extend(bens)
+                if not isinstance(doacoes, Exception):
+                    todas_doacoes.extend(doacoes)
 
-                doacoes = await self.coletar_doacoes(uf, ano)
-                todas_doacoes.extend(doacoes)
-
-                await asyncio.sleep(0.5)
+                # Pausa entre anos para não sobrecarregar o CDN
+                await asyncio.sleep(1.0)
 
             except Exception as e:
-                logger.warning(f"Erro TSE {uf}/{ano}: {e}")
+                logger.warning(f"TSE erro {uf}/{ano}: {e}")
                 continue
 
         # Consolida patrimônio por CPF
@@ -285,6 +297,11 @@ class TSECollector:
 
         for p in todos_politicos:
             p["patrimonio_declarado"] = patrimonio_por_cpf.get(p["cpf"], 0)
+
+        logger.info(
+            f"TSE {uf} completo: {len(todos_politicos)} políticos | "
+            f"{len(todos_bens)} bens | {len(todas_doacoes)} doações"
+        )
 
         return {
             "politicos": todos_politicos,
