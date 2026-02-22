@@ -366,11 +366,26 @@ class PNCPCollector:
 
         # --------------------------------------------------
         # 1. CONTRATOS (têm vencedor — prioridade máxima)
+        # O endpoint /contratos aceita no máximo ~30 dias por request.
+        # Janelas maiores retornam 422 nas páginas avançadas (24+).
         # --------------------------------------------------
         logger.info(f"PNCP coletando /contratos | UF={uf}")
-        contratos_raw = await self._coletar_todas_paginas(
-            ENDPOINT_CONTRATOS, params_base
-        )
+        contratos_raw = []
+        janela = 30
+        cursor = data_inicial
+        while cursor <= data_final:
+            fim = min(cursor + timedelta(days=janela - 1), data_final)
+            params_janela = {
+                k: v for k, v in params_base.items()
+                if k not in ("dataInicial", "dataFinal")
+            }
+            params_janela["dataInicial"] = cursor.strftime("%Y%m%d")
+            params_janela["dataFinal"]   = fim.strftime("%Y%m%d")
+            janela_raw = await self._coletar_todas_paginas(ENDPOINT_CONTRATOS, params_janela)
+            contratos_raw.extend(janela_raw)
+            cursor = fim + timedelta(days=1)
+            await asyncio.sleep(0.3)
+
         contratos = [self.normalizar_contrato(r) for r in contratos_raw if r]
         logger.info(f"PNCP /contratos: {len(contratos)} contratos | UF={uf}")
 
