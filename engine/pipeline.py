@@ -259,7 +259,14 @@ class Pipeline:
 
                     for lic_raw in lote:
                         try:
-                            lid = await self._upsert_licitacao(lic_raw)
+                            # Remove campos extras que não existem na tabela
+                            # (cnpj_fornecedor e nome_fornecedor são usados pelo pipeline
+                            # mas não fazem parte do schema de licitacoes)
+                            dados_db = {
+                                k: v for k, v in lic_raw.items()
+                                if k not in ("cnpj_fornecedor", "nome_fornecedor", "numero_controle_contrato")
+                            }
+                            lid = await self._upsert_licitacao(dados_db)
                             if not lid:
                                 continue
 
@@ -268,31 +275,15 @@ class Pipeline:
                                 lic_raw.get("objeto_descricao", "")
                             )
 
-                            # Extrai vencedor do raw_data PNCP
+                            # cnpj_fornecedor já vem normalizado pelo PNCPCollector
+                            # (vem do /contratos — empresa que assinou o contrato)
                             participantes = []
-                            raw = lic_raw.get("raw_data") or {}
-                            if isinstance(raw, str):
-                                import json
-                                try:
-                                    raw = json.loads(raw)
-                                except Exception:
-                                    raw = {}
+                            vencedor_cnpj = lic_raw.get("cnpj_fornecedor", "")
+                            vencedor_nome = lic_raw.get("nome_fornecedor", "")
 
-                            vencedor_cnpj = (
-                                raw.get("niFornecedor")
-                                or raw.get("cnpjFornecedor")
-                                or raw.get("cnpjContratada")
-                                or ""
-                            )
-                            vencedor_nome = (
-                                raw.get("nomeRazaoSocialFornecedor")
-                                or raw.get("razaoSocialFornecedor")
-                                or raw.get("nomeContratada")
-                                or ""
-                            )
                             if vencedor_cnpj:
                                 participantes.append({
-                                    "cnpj": "".join(filter(str.isdigit, vencedor_cnpj)),
+                                    "cnpj": vencedor_cnpj,
                                     "razao_social": vencedor_nome,
                                     "vencedor": True,
                                     "valor_proposta": lic_raw.get("valor_homologado"),
