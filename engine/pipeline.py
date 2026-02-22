@@ -4,7 +4,7 @@ Orquestra coleta → enriquecimento → análise → persistência.
 """
 
 import asyncio
-from datetime import date, timedelta, datetime  # Adicionado datetime para conversão
+from datetime import date, timedelta, datetime
 from loguru import logger
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
@@ -26,7 +26,6 @@ class Pipeline:
     # ----------------------------------------------------------
 
     async def _upsert_licitacao(self, dados: dict) -> str | None:
-        """Insere ou atualiza licitação. Retorna UUID."""
         sql = text("""
             INSERT INTO licitacoes (
                 fonte, numero_controle, orgao_cnpj, orgao_nome, orgao_esfera,
@@ -55,7 +54,6 @@ class Pipeline:
         params.setdefault("objeto_categoria", None)
         params.setdefault("numero_participantes", None)
 
-        # Conversão de strings para datas (fix para DataError)
         try:
             if params.get("data_abertura") and isinstance(params["data_abertura"], str):
                 params["data_abertura"] = datetime.strptime(params["data_abertura"], '%Y-%m-%d').date()
@@ -92,7 +90,6 @@ class Pipeline:
             ]
         })
 
-        # socios
         await self.db.execute(
             text("DELETE FROM socios WHERE cnpj = :cnpj"),
             {"cnpj": empresa["cnpj"]},
@@ -173,7 +170,6 @@ class Pipeline:
             "flag_prazo": resultado.flags.get("flag_prazo_suspeito", False),
         })
 
-        # relações detectadas
         for relacao in resultado.anomalias_relacao:
             await self.db.execute(
                 text("""
@@ -198,12 +194,7 @@ class Pipeline:
                 },
             )
 
-    # ----------------------------------------------------------
-    # HISTÓRICO DE PREÇOS (benchmark interno)
-    # ----------------------------------------------------------
-
     async def _buscar_historico_precos(self, categoria: str, uf: str) -> list[float]:
-        """Busca valores históricos de licitações similares no próprio banco."""
         result = await self.db.execute(
             text("""
                 SELECT valor_homologado FROM licitacoes
@@ -230,21 +221,22 @@ class Pipeline:
     ):
         logger.info(f"=== PIPELINE INICIADO | UF={uf} | IBGE={codigo_ibge} ===")
 
-        # 1. Carrega políticos da UF
+        # 1. Carrega políticos da UF (com concorrência limitada para não throttlar TSE)
         politicos = []
+        doacoes = []
         if uf:
-            async with TSECollector() as tse:
-                dados_tse = await tse.coletar_uf_completo(uf)
-                politicos = dados_tse["politicos"]
-                doacoes = dados_tse["doacoes"]
+            try:
+                async with TSECollector() as tse:
+                    dados_tse = await tse.coletar_uf_completo(uf)
+                    politicos = dados_tse["politicos"]
+                    doacoes = dados_tse["doacoes"]
 
-                # persiste políticos
-                for p in politicos:
-                    await self._upsert_politico(p)
-                await self.db.commit()
-                logger.info(f"Políticos persistidos: {len(politicos)}")
-        else:
-            doacoes = []
+                    for p in politicos:
+                        await self._upsert_politico(p)
+                    await self.db.commit()
+                    logger.info(f"Políticos persistidos: {len(politicos)}")
+            except Exception as e:
+                logger.warning(f"TSE falhou para UF={uf}: {e} — continuando sem dados TSE")
 
         # 2. Coleta licitações
         async with PNCPCollector(self.db) as pncp:
@@ -267,7 +259,6 @@ class Pipeline:
 
                     for lic_raw in lote:
                         try:
-                            # persiste licitação
                             lid = await self._upsert_licitacao(lic_raw)
                             if not lid:
                                 continue
@@ -277,22 +268,37 @@ class Pipeline:
                                 lic_raw.get("objeto_descricao", "")
                             )
 
-                            # busca participantes no PNCP
-                            # (simplificado: usa dados já normalizados)
+                            # Extrai vencedor do raw_data PNCP
                             participantes = []
-                            if lic_raw.get("raw_data"):
-                                raw = lic_raw["raw_data"]
-                                vencedor_cnpj = raw.get("niFornecedor") or raw.get("cnpjFornecedor", "")
-                                vencedor_nome = raw.get("nomeRazaoSocialFornecedor", "")
-                                if vencedor_cnpj:
-                                    participantes.append({
-                                        "cnpj": "".join(filter(str.isdigit, vencedor_cnpj)),
-                                        "razao_social": vencedor_nome,
-                                        "vencedor": True,
-                                        "valor_proposta": lic_raw.get("valor_homologado"),
-                                    })
+                            raw = lic_raw.get("raw_data") or {}
+                            if isinstance(raw, str):
+                                import json
+                                try:
+                                    raw = json.loads(raw)
+                                except Exception:
+                                    raw = {}
 
-                            # busca dados das empresas
+                            vencedor_cnpj = (
+                                raw.get("niFornecedor")
+                                or raw.get("cnpjFornecedor")
+                                or raw.get("cnpjContratada")
+                                or ""
+                            )
+                            vencedor_nome = (
+                                raw.get("nomeRazaoSocialFornecedor")
+                                or raw.get("razaoSocialFornecedor")
+                                or raw.get("nomeContratada")
+                                or ""
+                            )
+                            if vencedor_cnpj:
+                                participantes.append({
+                                    "cnpj": "".join(filter(str.isdigit, vencedor_cnpj)),
+                                    "razao_social": vencedor_nome,
+                                    "vencedor": True,
+                                    "valor_proposta": lic_raw.get("valor_homologado"),
+                                })
+
+                            # Enriquece empresas
                             cnpjs = [p["cnpj"] for p in participantes if p.get("cnpj")]
                             empresas = {}
                             socios_por_cnpj = {}
@@ -312,14 +318,19 @@ class Pipeline:
                                     if p["cnpj"] == cnpj:
                                         await self._salvar_participante(lid, p)
 
-                            # histórico de preços
                             historico = await self._buscar_historico_precos(
                                 categoria, lic_raw.get("orgao_uf", "")
                             )
 
-                            # ANÁLISE
+                            # *** FIX SCORE = 15 ***
+                            # Passa data_publicacao separada de data_abertura.
+                            # PNCP não tem data_publicacao distinta — não usar
+                            # data_abertura como fallback ou todo score fica 15.
                             resultado = self.engine.analisar_licitacao(
-                                licitacao=lic_raw,
+                                licitacao={
+                                    **lic_raw,
+                                    "data_publicacao": raw.get("dataPublicacao"),  # pode ser None
+                                },
                                 participantes=participantes,
                                 empresas=empresas,
                                 socios_por_cnpj=socios_por_cnpj,
@@ -340,7 +351,7 @@ class Pipeline:
 
                     await self.db.commit()
                     logger.info(f"Lote {i//BATCH + 1}/{(len(licitacoes_raw)-1)//BATCH + 1} concluído")
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(0.3)
 
         logger.info(f"=== PIPELINE CONCLUÍDO | {len(licitacoes_raw)} licitações | {total_anomalias} com anomalias ===")
         return {
