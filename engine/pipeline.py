@@ -4,7 +4,7 @@ Orquestra coleta → enriquecimento → análise → persistência.
 """
 
 import asyncio
-from datetime import date, timedelta
+from datetime import date, timedelta, datetime  # Adicionado datetime para conversão
 from loguru import logger
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
@@ -54,6 +54,16 @@ class Pipeline:
             params["raw_data"] = json.dumps(params["raw_data"])
         params.setdefault("objeto_categoria", None)
         params.setdefault("numero_participantes", None)
+
+        # Conversão de strings para datas (fix para DataError)
+        try:
+            if params.get("data_abertura") and isinstance(params["data_abertura"], str):
+                params["data_abertura"] = datetime.strptime(params["data_abertura"], '%Y-%m-%d').date()
+            if params.get("data_homologacao") and isinstance(params["data_homologacao"], str):
+                params["data_homologacao"] = datetime.strptime(params["data_homologacao"], '%Y-%m-%d').date()
+        except ValueError as e:
+            logger.warning(f"Data inválida na licitação {params.get('numero_controle')}: {e} – Skipando")
+            return None
 
         result = await self.db.execute(sql, params)
         row = result.fetchone()
