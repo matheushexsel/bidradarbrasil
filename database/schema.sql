@@ -7,7 +7,12 @@
 -- ============================================================
 
 CREATE EXTENSION IF NOT EXISTS pg_trgm;  -- busca fuzzy de nomes
-CREATE EXTENSION IF NOT EXISTS unaccent; -- normalização de acentos
+CREATE EXTENSION IF NOT EXISTS unaccent;
+
+-- Wrapper IMMUTABLE necessário para usar unaccent em índices GIN
+CREATE OR REPLACE FUNCTION immutable_unaccent(text)
+  RETURNS text LANGUAGE sql IMMUTABLE PARALLEL SAFE STRICT AS
+$func$ SELECT unaccent($1) $func$;
 
 -- ============================================================
 -- 1. LICITAÇÕES
@@ -104,7 +109,7 @@ CREATE TABLE IF NOT EXISTS empresas (
 
 CREATE INDEX idx_empresas_uf     ON empresas(uf);
 CREATE INDEX idx_empresas_cnae   ON empresas(cnae_principal);
-CREATE INDEX idx_empresas_nome   ON empresas USING GIN (unaccent(razao_social) gin_trgm_ops);
+CREATE INDEX idx_empresas_nome   ON empresas USING GIN (immutable_unaccent(razao_social) gin_trgm_ops);
 
 -- ============================================================
 -- 4. SÓCIOS (QSA - Receita Federal)
