@@ -1,19 +1,29 @@
 """
 Coletor PNCP - Portal Nacional de Contratações Públicas
-API: https://pncp.gov.br/api/pncp/v1
+
+NOTA: A API do PNCP NÃO suporta filtro por UF no endpoint de publicações.
+Parâmetros aceitos: dataInicial, dataFinal, pagina, tamanhoPagina.
+Filtragem por UF é feita em memória após a coleta.
 """
 
 import asyncio
 import httpx
 from datetime import date, timedelta
 from loguru import logger
-from tenacity import retry, stop_after_attempt, wait_exponential
 
-BASE_URL = "https://pncp.gov.br/api/pncp/v1"
+# Único endpoint funcional confirmado
+ENDPOINT = "https://pncp.gov.br/api/pncp/v1/contratacoes/publicacoes"
 
 HEADERS = {
-    "Accept": "application/json",
-    "User-Agent": "Mozilla/5.0 (compatible; BidRadarBrasil/1.0; +https://bidradarbrasil.com.br)",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "pt-BR,pt;q=0.9",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/121.0.0.0 Safari/537.36"
+    ),
+    "Referer": "https://pncp.gov.br/app/",
+    "Origin": "https://pncp.gov.br",
 }
 
 MODALIDADES_MAP = {
@@ -38,7 +48,7 @@ class PNCPCollector:
         self.db = db_session
         self.client = httpx.AsyncClient(
             headers=HEADERS,
-            timeout=60.0,
+            timeout=httpx.Timeout(connect=15.0, read=60.0, write=10.0, pool=10.0),
             follow_redirects=True,
         )
 
@@ -48,112 +58,96 @@ class PNCPCollector:
     async def __aexit__(self, *args):
         await self.client.aclose()
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=3, max=15))
-    async def _get(self, endpoint: str, params: dict = None) -> dict | list | None:
-        url = f"{BASE_URL}{endpoint}"
+    async def _get_pagina(self, params: dict) -> dict:
+        """Faz uma requisição sem filtro de UF (API não suporta esse filtro)."""
         try:
-            r = await self.client.get(url, params=params)
-            logger.debug(f"PNCP {r.status_code} {url} params={params}")
+            r = await self.client.get(ENDPOINT, params=params)
+            logger.debug(f"PNCP HTTP {r.status_code} | params={params}")
 
-            if r.status_code == 404:
-                return None
-            if r.status_code == 429:
-                logger.warning("PNCP rate limit — aguardando 30s")
-                await asyncio.sleep(30)
-                raise Exception("Rate limited")
+            if r.status_code == 200:
+                try:
+                    data = r.json()
+                    return self._normalizar_resposta(data)
+                except Exception as e:
+                    logger.warning(f"PNCP JSON inválido: {e} | body={r.text[:300]}")
+                    return {"data": [], "totalRegistros": 0, "totalPaginas": 0}
+
             if r.status_code == 204:
-                return None
+                return {"data": [], "totalRegistros": 0, "totalPaginas": 0}
 
-            r.raise_for_status()
+            logger.warning(f"PNCP HTTP {r.status_code} | body={r.text[:300]}")
+            return {"data": [], "totalRegistros": 0, "totalPaginas": 0}
 
-            # Log primeiros bytes para debug
-            text = r.text
-            if len(text) < 500:
-                logger.debug(f"PNCP resposta: {text}")
-
-            return r.json()
-
-        except httpx.HTTPStatusError as e:
-            logger.error(f"PNCP HTTP {e.response.status_code} em {url}: {e.response.text[:300]}")
-            raise
+        except httpx.TimeoutException as e:
+            logger.warning(f"PNCP timeout: {e}")
+        except httpx.ConnectError as e:
+            logger.warning(f"PNCP ConnectError: {e}")
         except Exception as e:
-            logger.error(f"PNCP erro em {url}: {type(e).__name__}: {e}")
-            raise
-
-    async def coletar_licitacoes(
-        self,
-        data_inicial: date = None,
-        data_final: date = None,
-        uf: str = None,
-        codigo_ibge: str = None,
-        pagina: int = 1,
-        tamanho: int = 50,
-    ) -> dict:
-        if data_inicial is None:
-            data_inicial = date.today() - timedelta(days=30)
-        if data_final is None:
-            data_final = date.today()
-
-        # PNCP aceita datas no formato YYYYMMDD
-        params = {
-            "dataInicial": data_inicial.strftime("%Y%m%d"),
-            "dataFinal": data_final.strftime("%Y%m%d"),
-            "pagina": pagina,
-            "tamanhoPagina": tamanho,
-        }
-        if uf:
-            params["uf"] = uf.upper()
-        if codigo_ibge:
-            params["codigoMunicipio"] = codigo_ibge
-
-        result = await self._get("/contratacoes/publicacoes", params=params)
-
-        if result is None:
-            return {"data": [], "totalRegistros": 0, "totalPaginas": 0}
-
-        # Trata diferentes estruturas de resposta do PNCP
-        if isinstance(result, list):
-            # Às vezes retorna lista direta
-            return {"data": result, "totalRegistros": len(result), "totalPaginas": 1}
-
-        if isinstance(result, dict):
-            # Estrutura padrão: {data: [...], totalRegistros: N, totalPaginas: N}
-            if "data" in result:
-                return result
-            # Estrutura alternativa: {content: [...], totalElements: N, totalPages: N}
-            if "content" in result:
-                return {
-                    "data": result["content"],
-                    "totalRegistros": result.get("totalElements", 0),
-                    "totalPaginas": result.get("totalPages", 1),
-                }
-            # Retornou dict mas sem estrutura conhecida — loga para debug
-            logger.warning(f"PNCP resposta inesperada. Chaves: {list(result.keys())}")
-            return {"data": [], "totalRegistros": 0, "totalPaginas": 0}
+            logger.warning(f"PNCP {type(e).__name__}: {e}")
 
         return {"data": [], "totalRegistros": 0, "totalPaginas": 0}
 
+    def _normalizar_resposta(self, data) -> dict:
+        if data is None:
+            return {"data": [], "totalRegistros": 0, "totalPaginas": 0}
+        if isinstance(data, list):
+            return {"data": data, "totalRegistros": len(data), "totalPaginas": 1}
+        if isinstance(data, dict):
+            if "data" in data:
+                return {
+                    "data": data.get("data") or [],
+                    "totalRegistros": data.get("totalRegistros", 0),
+                    "totalPaginas": max(data.get("totalPaginas", 1) or 1, 1),
+                }
+            if "content" in data:
+                return {
+                    "data": data.get("content") or [],
+                    "totalRegistros": data.get("totalElements", 0),
+                    "totalPaginas": max(data.get("totalPages", 1) or 1, 1),
+                }
+            logger.warning(f"PNCP estrutura desconhecida: {list(data.keys())[:8]}")
+        return {"data": [], "totalRegistros": 0, "totalPaginas": 0}
+
+    def _extrair_uf(self, raw: dict) -> str:
+        """Extrai a UF de um item da resposta PNCP."""
+        municipio = raw.get("unidadeOrgao", {})
+        return (
+            municipio.get("ufSigla", "")
+            or municipio.get("uf", "")
+            or raw.get("uf", "")
+            or raw.get("ufSigla", "")
+        ).upper()
+
     def normalizar_licitacao(self, raw: dict) -> dict:
-        """Normaliza o JSON bruto do PNCP para o schema interno."""
         orgao = raw.get("orgaoEntidade", {})
         municipio = raw.get("unidadeOrgao", {})
-        cnpj = orgao.get("cnpj", "")
 
-        # Determina esfera
-        esfera_id = raw.get("esferaId", "")
-        esfera_map = {"F": "FEDERAL", "E": "ESTADUAL", "M": "MUNICIPAL"}
-        esfera = esfera_map.get(str(esfera_id), str(esfera_id))
+        esfera_id = str(raw.get("esferaId", ""))
+        esfera_map = {
+            "F": "FEDERAL", "E": "ESTADUAL", "M": "MUNICIPAL",
+            "1": "FEDERAL", "2": "ESTADUAL", "3": "MUNICIPAL",
+        }
 
         return {
             "fonte": "PNCP",
             "numero_controle": raw.get("numeroControlePNCP", ""),
-            "orgao_cnpj": cnpj,
+            "orgao_cnpj": orgao.get("cnpj", ""),
             "orgao_nome": orgao.get("razaoSocial", ""),
-            "orgao_esfera": esfera,
-            "orgao_uf": municipio.get("ufSigla", "") or raw.get("uf", ""),
-            "orgao_municipio": municipio.get("nomeUnidade", "") or municipio.get("municipioNome", ""),
-            "orgao_codigo_ibge": municipio.get("codigoIBGE", "") or municipio.get("municipioIbge", ""),
-            "modalidade": MODALIDADES_MAP.get(raw.get("modalidadeId"), raw.get("modalidadeNome", "")),
+            "orgao_esfera": esfera_map.get(esfera_id, "MUNICIPAL"),
+            "orgao_uf": self._extrair_uf(raw),
+            "orgao_municipio": (
+                municipio.get("nomeUnidade", "")
+                or municipio.get("municipioNome", "")
+            ),
+            "orgao_codigo_ibge": (
+                municipio.get("codigoIBGE", "")
+                or municipio.get("municipioIbge", "")
+                or municipio.get("codigoIbge", "")
+            ),
+            "modalidade": MODALIDADES_MAP.get(
+                raw.get("modalidadeId"),
+                raw.get("modalidadeNome", "")
+            ),
             "tipo_objeto": raw.get("tipoInstrumentoConvocatorioNome", ""),
             "objeto_descricao": raw.get("objetoCompra", ""),
             "valor_estimado": raw.get("valorTotalEstimado"),
@@ -161,37 +155,8 @@ class PNCPCollector:
             "data_abertura": (raw.get("dataPublicacaoPncp") or "")[:10] or None,
             "data_homologacao": (raw.get("dataResultadoCompra") or "")[:10] or None,
             "situacao": raw.get("situacaoCompraNome", ""),
-            "numero_participantes": raw.get("quantidadeItens"),
             "raw_data": raw,
         }
-
-    async def testar_api(self) -> dict:
-        """Testa a conectividade com a API do PNCP e retorna diagnóstico."""
-        logger.info("Testando API do PNCP...")
-
-        # Testa com data recente (últimos 7 dias)
-        hoje = date.today()
-        semana = hoje - timedelta(days=7)
-
-        params = {
-            "dataInicial": semana.strftime("%Y%m%d"),
-            "dataFinal": hoje.strftime("%Y%m%d"),
-            "pagina": 1,
-            "tamanhoPagina": 5,
-        }
-
-        try:
-            r = await self.client.get(
-                f"{BASE_URL}/contratacoes/publicacoes",
-                params=params
-            )
-            logger.info(f"PNCP status: {r.status_code}")
-            logger.info(f"PNCP headers: {dict(r.headers)}")
-            logger.info(f"PNCP body (500 chars): {r.text[:500]}")
-            return {"status": r.status_code, "body": r.text[:500]}
-        except Exception as e:
-            logger.error(f"PNCP teste falhou: {e}")
-            return {"status": "erro", "body": str(e)}
 
     async def coletar_tudo(
         self,
@@ -199,57 +164,69 @@ class PNCPCollector:
         codigo_ibge: str = None,
         dias_retroativos: int = 30,
     ) -> list[dict]:
-        """Coleta todas as licitações paginando automaticamente."""
-        data_inicial = date.today() - timedelta(days=dias_retroativos)
+        """
+        Coleta licitações do PNCP.
+        NOTA: A API não suporta filtro por UF — coleta nacional e filtra em memória.
+        Para evitar sobrecarga, usa janelas de 7 dias quando uf é especificado.
+        """
         data_final = date.today()
+        data_inicial = data_final - timedelta(days=dias_retroativos)
 
         logger.info(
-            f"Iniciando coleta PNCP | UF={uf} | IBGE={codigo_ibge} | "
+            f"Iniciando coleta PNCP | UF={uf} | "
             f"Período: {data_inicial} → {data_final}"
         )
 
-        # Primeira página — descobre total
-        primeira = await self.coletar_licitacoes(
-            data_inicial=data_inicial,
-            data_final=data_final,
-            uf=uf,
-            codigo_ibge=codigo_ibge,
-            pagina=1,
-            tamanho=50,
-        )
+        # Coleta em janelas de 7 dias para reduzir volume por request
+        janela_dias = 7
+        todas_licitacoes: list[dict] = []
 
-        total_paginas = primeira.get("totalPaginas", 1) or 1
-        total_registros = primeira.get("totalRegistros", 0)
-        logger.info(f"PNCP: {total_registros} registros em {total_paginas} páginas | UF={uf}")
+        cursor = data_inicial
+        while cursor <= data_final:
+            fim_janela = min(cursor + timedelta(days=janela_dias - 1), data_final)
 
-        resultados = [self.normalizar_licitacao(r) for r in primeira.get("data", [])]
+            params = {
+                "dataInicial": cursor.strftime("%Y%m%d"),
+                "dataFinal": fim_janela.strftime("%Y%m%d"),
+                "pagina": 1,
+                "tamanhoPagina": 50,
+            }
 
-        if total_paginas <= 1:
-            logger.info(f"Coleta PNCP concluída: {len(resultados)} licitações | UF={uf}")
-            return resultados
+            primeira = await self._get_pagina(params)
+            total_paginas = max(primeira.get("totalPaginas", 1) or 1, 1)
+            total_registros = primeira.get("totalRegistros", 0)
 
-        # Coleta demais páginas em lotes de 5
-        for i in range(0, list(range(2, total_paginas + 1)).__len__(), 5):
-            lote = list(range(2, total_paginas + 1))[i:i+5]
-            tasks = [
-                self.coletar_licitacoes(
-                    data_inicial=data_inicial,
-                    data_final=data_final,
-                    uf=uf,
-                    codigo_ibge=codigo_ibge,
-                    pagina=p,
-                    tamanho=50,
-                )
-                for p in lote
-            ]
-            respostas = await asyncio.gather(*tasks, return_exceptions=True)
-            for resp in respostas:
-                if isinstance(resp, Exception):
-                    logger.warning(f"Erro em página do lote: {resp}")
-                    continue
-                resultados.extend([self.normalizar_licitacao(r) for r in resp.get("data", [])])
+            logger.info(
+                f"PNCP {cursor}→{fim_janela}: "
+                f"{total_registros} registros em {total_paginas} páginas"
+            )
 
+            lote = [self.normalizar_licitacao(r) for r in primeira.get("data", []) if r]
+
+            # Páginas restantes
+            paginas = list(range(2, min(total_paginas + 1, 21)))  # máx 20 páginas por janela
+            for i in range(0, len(paginas), 5):
+                tasks = [
+                    self._get_pagina({**params, "pagina": p})
+                    for p in paginas[i:i + 5]
+                ]
+                respostas = await asyncio.gather(*tasks, return_exceptions=True)
+                for resp in respostas:
+                    if isinstance(resp, Exception):
+                        continue
+                    lote.extend([self.normalizar_licitacao(r) for r in resp.get("data", []) if r])
+                await asyncio.sleep(0.5)
+
+            todas_licitacoes.extend(lote)
+            cursor = fim_janela + timedelta(days=1)
             await asyncio.sleep(1)
 
-        logger.info(f"Coleta PNCP concluída: {len(resultados)} licitações | UF={uf}")
-        return resultados
+        # Filtra por UF em memória
+        if uf:
+            uf_upper = uf.upper()
+            resultado = [l for l in todas_licitacoes if l.get("orgao_uf") == uf_upper]
+            logger.info(f"PNCP concluído: {len(resultado)}/{len(todas_licitacoes)} licitações para UF={uf}")
+            return resultado
+
+        logger.info(f"PNCP concluído: {len(todas_licitacoes)} licitações")
+        return todas_licitacoes
